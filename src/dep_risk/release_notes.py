@@ -8,7 +8,6 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
-from bs4 import BeautifulSoup
 
 from .config import Cache, Config
 from .models import AffectedPackage, Ecosystem, ReleaseNote

@@ -27,7 +27,6 @@ dependencies = [
     "click>=8.0",
     "httpx>=0.25",
     "pydantic>=2.0",
-    "beautifulsoup4>=4.12",
     "rich>=13.0",
     "platformdirs>=4.0",
 ]
