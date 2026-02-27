@@ -129,3 +129,129 @@ class TestFetch:
         fetcher = ReleaseNotesFetcher(config)
         results = await fetcher.fetch([])
         assert results == {}
+
+
+class TestCargoReleases:
+    """Tests for crates.io release note fetching."""
+
+    @pytest.mark.asyncio
+    async def test_fetches_versions_from_crates_io(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from dep_risk.config import Config
+        from dep_risk.release_notes import ReleaseNotesFetcher
+
+        config = Config()
+        fetcher = ReleaseNotesFetcher(config)
+
+        crates_response = MagicMock()
+        crates_response.status_code = 200
+        crates_response.json.return_value = {
+            "crate": {"repository": None},
+            "versions": [
+                {"num": "1.2.0", "created_at": "2024-01-15T10:00:00Z"},
+                {"num": "1.1.0", "created_at": "2024-01-01T10:00:00Z"},
+                {"num": "1.0.0", "created_at": "2023-12-01T10:00:00Z"},
+            ],
+        }
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=crates_response)
+        fetcher._client = mock_client
+
+        notes = await fetcher._fetch_cargo_releases("serde", "1.0.0", "1.2.0")
+
+        assert len(notes) == 2  # 1.1.0 and 1.2.0 in range; 1.0.0 excluded (start is exclusive)
+        assert all(n.source == "crates.io" for n in notes)
+
+    @pytest.mark.asyncio
+    async def test_prefers_github_releases_over_crates_stub(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from dep_risk.config import Config
+        from dep_risk.models import ReleaseNote
+        from dep_risk.release_notes import ReleaseNotesFetcher
+
+        config = Config()
+        fetcher = ReleaseNotesFetcher(config)
+
+        crates_response = MagicMock()
+        crates_response.status_code = 200
+        crates_response.json.return_value = {
+            "crate": {"repository": "https://github.com/serde-rs/serde"},
+            "versions": [],
+        }
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=crates_response)
+        fetcher._client = mock_client
+
+        github_note = ReleaseNote(version="1.2.0", content="GitHub release", source="GitHub Releases")
+        with patch.object(fetcher, "_fetch_github_releases", return_value=[github_note]):
+            notes = await fetcher._fetch_cargo_releases("serde", "1.1.0", "1.2.0")
+
+        assert len(notes) == 1
+        assert notes[0].source == "GitHub Releases"
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_http_error(self):
+        from unittest.mock import AsyncMock
+        import httpx
+        from dep_risk.config import Config
+        from dep_risk.release_notes import ReleaseNotesFetcher
+
+        config = Config()
+        fetcher = ReleaseNotesFetcher(config)
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=httpx.RequestError("timeout"))
+        fetcher._client = mock_client
+
+        notes = await fetcher._fetch_cargo_releases("serde")
+        assert notes == []
+
+
+class TestMavenReleases:
+    """Tests for Maven release note fetching."""
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_without_github(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from dep_risk.config import Config
+        from dep_risk.release_notes import ReleaseNotesFetcher
+
+        config = Config()
+        fetcher = ReleaseNotesFetcher(config)
+
+        search_response = MagicMock()
+        search_response.status_code = 200
+        search_response.json.return_value = {
+            "response": {"docs": [{"g": "org.example", "a": "mylib"}]}
+        }
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=search_response)
+        fetcher._client = mock_client
+
+        notes = await fetcher._fetch_maven_releases("org.example:mylib")
+        assert notes == []
+
+    @pytest.mark.asyncio
+    async def test_uses_github_when_groupid_matches(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from dep_risk.config import Config
+        from dep_risk.models import ReleaseNote
+        from dep_risk.release_notes import ReleaseNotesFetcher
+
+        config = Config()
+        fetcher = ReleaseNotesFetcher(config)
+
+        search_response = MagicMock()
+        search_response.status_code = 200
+        search_response.json.return_value = {
+            "response": {"docs": [{"g": "io.github.myorg", "a": "mylib"}]}
+        }
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=search_response)
+        fetcher._client = mock_client
+
+        github_note = ReleaseNote(version="2.0.0", content="GitHub release", source="GitHub Releases")
+        with patch.object(fetcher, "_fetch_github_releases", return_value=[github_note]):
+            notes = await fetcher._fetch_maven_releases("io.github.myorg:mylib")
+
+        assert len(notes) == 1
+        assert notes[0].source == "GitHub Releases"

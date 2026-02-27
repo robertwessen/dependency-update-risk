@@ -51,7 +51,7 @@ Ordered by impact-to-effort ratio. Items at the top deliver the most value for t
 
 ---
 
-## #6 — crates.io + Maven release notes
+## ~~#6 — crates.io + Maven release notes~~ ✅ Done
 **Impact:** Medium | **Effort:** Medium
 
 - Add `elif` branches in `fetch_for_package()` for Cargo and Maven ecosystems
@@ -60,7 +60,7 @@ Ordered by impact-to-effort ratio. Items at the top deliver the most value for t
 
 ---
 
-## #7 — `--format` flag (markdown, SARIF)
+## ~~#7 — `--format` flag (markdown, SARIF)~~ ✅ Done
 **Impact:** Medium | **Effort:** Medium
 
 - Flag: `--format [rich|json|markdown|sarif]`

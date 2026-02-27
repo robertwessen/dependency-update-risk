@@ -89,7 +89,10 @@ class ReleaseNotesFetcher:
         self._client: Optional[httpx.AsyncClient] = None
 
     async def __aenter__(self) -> "ReleaseNotesFetcher":
-        headers = {"Accept": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "dep-risk/1.1.0 (https://github.com/robertwessen/dependency-update-risk)",
+        }
         if self.config.github_token:
             headers["Authorization"] = f"token {self.config.github_token}"
         self._client = httpx.AsyncClient(timeout=30.0, headers=headers)
@@ -446,6 +449,169 @@ class ReleaseNotesFetcher:
 
         return notes
 
+    async def _fetch_cargo_releases(
+        self,
+        package_name: str,
+        start_version: Optional[str] = None,
+        end_version: Optional[str] = None,
+    ) -> list[ReleaseNote]:
+        """Fetch release information from crates.io, preferring GitHub releases."""
+        cache_key = f"cargo_{package_name}"
+        if self.cache and self.config.use_cache:
+            cached = self.cache.get("releases", cache_key)
+            if cached:
+                logger.debug(f"Using cached crates.io data for {package_name}")
+                data = cached
+            else:
+                data = None
+        else:
+            data = None
+
+        if data is None:
+            logger.debug(f"Fetching crates.io data for {package_name}")
+            try:
+                response = await self._client.get(
+                    f"https://crates.io/api/v1/crates/{package_name}"
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                if self.cache:
+                    self.cache.set("releases", cache_key, data)
+            except httpx.HTTPStatusError as e:
+                logger.warning(f"crates.io API error for {package_name}: {e.response.status_code}")
+                return []
+            except httpx.RequestError as e:
+                logger.warning(f"crates.io API request failed for {package_name}: {e}")
+                return []
+
+        # Try GitHub releases first if repo URL is available
+        crate_info = data.get("crate", {})
+        repo_url = crate_info.get("repository", "")
+        if repo_url:
+            github_info = _extract_github_info(repo_url)
+            if github_info:
+                owner, repo = github_info
+                github_notes = await self._fetch_github_releases(
+                    owner, repo, start_version, end_version
+                )
+                if github_notes:
+                    return github_notes
+                changelog = await self._fetch_github_changelog(owner, repo)
+                if changelog:
+                    changelog_notes = self._parse_changelog(changelog, start_version, end_version)
+                    if changelog_notes:
+                        return changelog_notes
+
+        # Fall back to versions list from crates.io
+        versions_data = data.get("versions", [])
+        notes = []
+        for ver in versions_data:
+            version = ver.get("num", "")
+            if not version or not _version_in_range(version, start_version, end_version):
+                continue
+
+            date = None
+            created_at = ver.get("created_at")
+            if created_at:
+                try:
+                    date = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                except ValueError:
+                    pass
+
+            notes.append(
+                ReleaseNote(
+                    version=version,
+                    date=date,
+                    content=f"Release {version}",
+                    source="crates.io",
+                    url=f"https://crates.io/crates/{package_name}/{version}",
+                )
+            )
+
+        return notes
+
+    async def _fetch_maven_releases(
+        self,
+        package_name: str,
+        start_version: Optional[str] = None,
+        end_version: Optional[str] = None,
+    ) -> list[ReleaseNote]:
+        """Fetch release notes for Maven packages via GitHub fallback."""
+        # Parse groupId:artifactId format
+        if ":" in package_name:
+            group_id, artifact_id = package_name.split(":", 1)
+        else:
+            group_id, artifact_id = None, package_name
+
+        # Query Maven Central search for SCM/repository URL
+        cache_key = f"maven_{package_name}"
+        if self.cache and self.config.use_cache:
+            cached = self.cache.get("releases", cache_key)
+            if cached:
+                logger.debug(f"Using cached Maven search data for {package_name}")
+                search_data = cached
+            else:
+                search_data = None
+        else:
+            search_data = None
+
+        if search_data is None:
+            logger.debug(f"Searching Maven Central for {package_name}")
+            try:
+                query = f"a:{artifact_id}"
+                if group_id:
+                    query += f" AND g:{group_id}"
+                response = await self._client.get(
+                    "https://search.maven.org/solrsearch/select",
+                    params={"q": query, "rows": 1, "wt": "json"},
+                )
+                response.raise_for_status()
+                search_data = response.json()
+
+                if self.cache:
+                    self.cache.set("releases", cache_key, search_data)
+            except httpx.HTTPStatusError as e:
+                logger.warning(f"Maven Central search error for {package_name}: {e.response.status_code}")
+                return []
+            except httpx.RequestError as e:
+                logger.warning(f"Maven Central search failed for {package_name}: {e}")
+                return []
+
+        # Extract repository URL from search result
+        docs = search_data.get("response", {}).get("docs", [])
+        repo_url = None
+        if docs:
+            # Maven Central search doesn't return SCM URLs directly; check common patterns
+            g = docs[0].get("g", group_id or "")
+            a = docs[0].get("a", artifact_id)
+            if g:
+                # Convert reverse-domain groupId like io.github.myorg → github.com/myorg/artifact
+                parts = g.split(".")
+                if len(parts) >= 3 and parts[1] == "github":
+                    repo_url = f"https://github.com/{parts[2]}/{a}"
+
+        if repo_url:
+            github_info = _extract_github_info(repo_url)
+            if github_info:
+                owner, repo = github_info
+                github_notes = await self._fetch_github_releases(
+                    owner, repo, start_version, end_version
+                )
+                if github_notes:
+                    return github_notes
+                changelog = await self._fetch_github_changelog(owner, repo)
+                if changelog:
+                    changelog_notes = self._parse_changelog(changelog, start_version, end_version)
+                    if changelog_notes:
+                        return changelog_notes
+
+        logger.debug(
+            f"No GitHub repository found for Maven package {package_name}; "
+            f"release notes unavailable"
+        )
+        return []
+
     async def fetch_for_package(
         self,
         package: AffectedPackage,
@@ -480,6 +646,14 @@ class ReleaseNotesFetcher:
                 )
             elif package.ecosystem == Ecosystem.NPM:
                 notes = await self._fetch_npm_releases(
+                    package.name, start_version, end_version
+                )
+            elif package.ecosystem == Ecosystem.CARGO:
+                notes = await self._fetch_cargo_releases(
+                    package.name, start_version, end_version
+                )
+            elif package.ecosystem == Ecosystem.MAVEN:
+                notes = await self._fetch_maven_releases(
                     package.name, start_version, end_version
                 )
 

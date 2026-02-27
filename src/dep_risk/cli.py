@@ -32,7 +32,124 @@ def setup_logging(verbose: bool) -> None:
     )
 
 
+_SARIF_LEVEL = {"low": "note", "medium": "warning", "high": "error", "critical": "error"}
 _RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+
+def _format_markdown(result: dict) -> str:
+    """Format analysis result as Markdown."""
+    lines = [
+        f"# dep-risk Analysis: {result.get('cve_id', 'N/A')}",
+        "",
+        "| Field | Value |",
+        "|-------|-------|",
+        f"| Package | {result.get('package_name', 'N/A')} ({result.get('ecosystem', 'N/A')}) |",
+        f"| Version | {result.get('current_version', '?')} → {result.get('target_version', '?')} |",
+        f"| Risk Level | {result.get('risk_level', 'unknown').upper()} |",
+    ]
+    if "confidence" in result:
+        lines.append(f"| Confidence | {result['confidence']:.0%} |")
+    lines.append(f"| Release Notes | {result.get('release_notes_analyzed', 0)} analyzed |")
+
+    summary = result.get("analysis_summary", "")
+    if summary:
+        lines += ["", "## Summary", "", summary]
+
+    breaking_changes = result.get("breaking_changes", [])
+    if breaking_changes:
+        lines += [
+            "",
+            "## Breaking Changes",
+            "",
+            "| Description | Affected API | Migration Hint |",
+            "|-------------|-------------|----------------|",
+        ]
+        for bc in breaking_changes:
+            if isinstance(bc, dict):
+                desc = bc.get("description", "")
+                api = bc.get("affected_api", "-") or "-"
+                hint = bc.get("migration_hint", "-") or "-"
+                lines.append(f"| {desc} | {api} | {hint} |")
+
+    migration_notes = result.get("migration_notes", [])
+    if migration_notes:
+        lines += ["", "## Migration Notes", ""]
+        lines += [f"- {note}" for note in migration_notes]
+
+    deprecations = result.get("deprecations", [])
+    if deprecations:
+        lines += ["", "## Deprecations", ""]
+        lines += [f"- {dep}" for dep in deprecations]
+
+    return "\n".join(lines) + "\n"
+
+
+def _format_sarif(result: dict) -> str:
+    """Format analysis result as SARIF 2.1.0."""
+    cve_id = result.get("cve_id", "UNKNOWN")
+    risk_level = result.get("risk_level", "low")
+    package_name = result.get("package_name", "unknown")
+    ecosystem = result.get("ecosystem", "unknown")
+    current_version = result.get("current_version", "unknown")
+    target_version = result.get("target_version", "unknown")
+    summary = result.get("analysis_summary") or (
+        f"Risk level: {risk_level}. "
+        f"Update {package_name} from {current_version} to {target_version}."
+    )
+
+    sarif = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "dep-risk",
+                        "version": __version__,
+                        "informationUri": "https://github.com/robertwessen/dependency-update-risk",
+                        "rules": [
+                            {
+                                "id": cve_id,
+                                "name": "DependencyUpdateRisk",
+                                "shortDescription": {
+                                    "text": f"Breaking change risk for {cve_id} fix"
+                                },
+                                "helpUri": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+                            }
+                        ],
+                    }
+                },
+                "results": [
+                    {
+                        "ruleId": cve_id,
+                        "level": _SARIF_LEVEL.get(risk_level, "note"),
+                        "message": {"text": summary},
+                        "locations": [
+                            {
+                                "logicalLocations": [
+                                    {
+                                        "name": package_name,
+                                        "kind": "package",
+                                        "fullyQualifiedName": (
+                                            f"{ecosystem}/{package_name}@{current_version}"
+                                        ),
+                                    }
+                                ]
+                            }
+                        ],
+                        "properties": {
+                            "risk_level": risk_level,
+                            "current_version": current_version,
+                            "target_version": target_version,
+                            "breaking_changes_count": len(result.get("breaking_changes", [])),
+                            **({"confidence": result["confidence"]} if "confidence" in result else {}),
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    return json.dumps(sarif, indent=2)
 
 
 def _check_exit_risk(actual_risk: str, threshold: str) -> bool:
@@ -127,9 +244,16 @@ def main() -> None:
     help="Specific package to analyze (if CVE affects multiple)",
 )
 @click.option(
+    "--format", "output_format",
+    type=click.Choice(["rich", "json", "markdown", "sarif"], case_sensitive=False),
+    default="rich",
+    help="Output format: rich (default), json, markdown, or sarif",
+)
+@click.option(
     "--json-only",
     is_flag=True,
-    help="Output only JSON, no rich formatting",
+    hidden=True,
+    help="Deprecated: use --format json instead",
 )
 @click.option(
     "--nvd-api-key",
@@ -155,6 +279,7 @@ def analyze(
     debug: bool,
     max_context: int,
     package: Optional[str],
+    output_format: str,
     json_only: bool,
     nvd_api_key: Optional[str],
     min_exit_risk: Optional[str],
@@ -163,6 +288,10 @@ def analyze(
 
     CVE_ID is the CVE identifier (e.g., CVE-2024-3094).
     """
+    # Back-compat: --json-only maps to --format json
+    if json_only:
+        output_format = "json"
+
     # Enable verbose logging if debug is set
     setup_logging(verbose or debug)
     logger = logging.getLogger(__name__)
@@ -187,7 +316,7 @@ def analyze(
         nonlocal current_version  # Allow modification of outer variable
 
         # Step 1: Resolve CVE
-        if not json_only:
+        if output_format == "rich":
             console.print(f"\n[bold blue]Resolving CVE {cve_id}...[/bold blue]")
 
         async with CVEResolver(config, cache) as resolver:
@@ -203,7 +332,7 @@ def analyze(
             )
             sys.exit(1)
 
-        if not json_only:
+        if output_format == "rich":
             console.print(f"  Found {len(cve_info.affected_packages)} affected package(s)")
             console.print(f"  Severity: {cve_info.severity.value}")
             if cve_info.cvss_score:
@@ -225,7 +354,7 @@ def analyze(
                 sys.exit(1)
         else:
             target_package = cve_info.affected_packages[0]
-            if len(cve_info.affected_packages) > 1 and not json_only:
+            if len(cve_info.affected_packages) > 1 and output_format == "rich":
                 console.print(
                     f"[dim]Multiple packages affected. Using first: {target_package.name}[/dim]"
                 )
@@ -242,7 +371,7 @@ def analyze(
                     target_package.fixed_versions[0]
                 )
                 if estimated is None:
-                    if not json_only:
+                    if output_format == "rich":
                         console.print(
                             f"[bold yellow]Warning:[/bold yellow] Cannot estimate previous version for "
                             f"{target_package.fixed_versions[0]} (likely a major version boundary). "
@@ -251,20 +380,20 @@ def analyze(
                     current_version = "unknown"
                 else:
                     current_version = estimated
-                    if version_is_ambiguous and not json_only:
+                    if version_is_ambiguous and output_format == "rich":
                         console.print(
                             f"[dim]Note: Version {current_version} is an estimate. Use --version for accuracy.[/dim]"
                         )
             else:
                 current_version = "unknown"
 
-        if not json_only:
+        if output_format == "rich":
             console.print(f"\n[bold blue]Analyzing {target_package.name}...[/bold blue]")
             console.print(f"  Current version: {current_version}")
             console.print(f"  Target version: {target_version}")
 
         # Step 2: Fetch release notes
-        if not json_only:
+        if output_format == "rich":
             console.print(f"\n[bold blue]Fetching release notes...[/bold blue]")
 
         async with ReleaseNotesFetcher(config, cache) as fetcher:
@@ -274,7 +403,7 @@ def analyze(
                 end_version=target_version,
             )
 
-        if not json_only:
+        if output_format == "rich":
             console.print(f"  Found {len(release_notes)} release note(s)")
 
         # Step 3: Analyze with LLM
@@ -297,7 +426,7 @@ def analyze(
                 "note": "LLM analysis skipped - API not configured",
             }
         else:
-            if not json_only:
+            if output_format == "rich":
                 console.print(f"\n[bold blue]Analyzing breaking changes with LLM...[/bold blue]")
 
             async with LLMAnalyzer(config) as analyzer:
@@ -320,15 +449,24 @@ def analyze(
         # Output results
         json_output = json.dumps(result, indent=2, default=str)
 
+        if output_format == "markdown":
+            output_str = _format_markdown(result)
+        elif output_format == "sarif":
+            output_str = _format_sarif(result)
+        else:
+            output_str = json_output
+
         if output:
             with open(output, "w") as f:
-                f.write(json_output)
-            if not json_only:
+                f.write(output_str)
+            if output_format == "rich":
                 console.print(f"\n[green]Results written to {output}[/green]")
-        elif json_only:
+        elif output_format == "json":
             print(json_output)
+        elif output_format in ("markdown", "sarif"):
+            print(output_str)
         else:
-            # Pretty print with rich
+            # rich (default)
             console.print("\n")
             _print_rich_results(result)
 
@@ -340,7 +478,7 @@ def analyze(
     if min_exit_risk and result:
         actual_risk = result.get("risk_level", "")
         if _check_exit_risk(actual_risk, min_exit_risk):
-            if not json_only:
+            if output_format == "rich":
                 console.print(
                     f"[bold red]Exiting with code 1:[/bold red] risk level "
                     f"[bold]{actual_risk}[/bold] meets --min-exit-risk threshold ({min_exit_risk})"

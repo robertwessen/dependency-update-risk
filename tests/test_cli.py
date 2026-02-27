@@ -16,7 +16,7 @@ class TestCLI:
         runner = CliRunner()
         result = runner.invoke(main, ["--version"])
         assert result.exit_code == 0
-        assert "0.1.0" in result.output
+        assert "1.1.0" in result.output
 
     def test_analyze_help(self):
         runner = CliRunner()
@@ -93,3 +93,86 @@ class TestMinExitRisk:
     def test_unknown_risk_never_triggers_exit(self):
         from dep_risk.cli import _check_exit_risk
         assert _check_exit_risk("unknown", "high") is False
+
+
+SAMPLE_RESULT = {
+    "cve_id": "CVE-2024-1234",
+    "package_name": "requests",
+    "ecosystem": "PyPI",
+    "current_version": "2.30.0",
+    "target_version": "2.31.0",
+    "risk_level": "high",
+    "confidence": 0.85,
+    "breaking_changes": [
+        {
+            "description": "Removed legacy auth",
+            "affected_api": "auth.basic",
+            "migration_hint": "Use auth.bearer",
+        }
+    ],
+    "migration_notes": ["Update auth calls"],
+    "deprecations": [],
+    "analysis_summary": "One breaking change found.",
+    "release_notes_analyzed": 3,
+}
+
+
+class TestFormatOutput:
+    def test_format_markdown_has_headers(self):
+        from dep_risk.cli import _format_markdown
+        output = _format_markdown(SAMPLE_RESULT)
+        assert "# dep-risk Analysis: CVE-2024-1234" in output
+        assert "## Summary" in output
+        assert "## Breaking Changes" in output
+        assert "## Migration Notes" in output
+
+    def test_format_markdown_skips_empty_sections(self):
+        from dep_risk.cli import _format_markdown
+        result = {**SAMPLE_RESULT, "breaking_changes": [], "deprecations": [], "migration_notes": []}
+        output = _format_markdown(result)
+        assert "## Breaking Changes" not in output
+        assert "## Migration Notes" not in output
+        assert "## Deprecations" not in output
+
+    def test_format_markdown_omits_confidence_when_absent(self):
+        from dep_risk.cli import _format_markdown
+        result = {k: v for k, v in SAMPLE_RESULT.items() if k != "confidence"}
+        output = _format_markdown(result)
+        assert "Confidence" not in output
+
+    def test_format_sarif_valid_json(self):
+        import json
+        from dep_risk.cli import _format_sarif
+        output = _format_sarif(SAMPLE_RESULT)
+        parsed = json.loads(output)
+        assert parsed["version"] == "2.1.0"
+        assert parsed["runs"][0]["results"][0]["ruleId"] == "CVE-2024-1234"
+
+    def test_format_sarif_level_high_maps_to_error(self):
+        import json
+        from dep_risk.cli import _format_sarif
+        parsed = json.loads(_format_sarif({**SAMPLE_RESULT, "risk_level": "high"}))
+        assert parsed["runs"][0]["results"][0]["level"] == "error"
+
+    def test_format_sarif_level_medium_maps_to_warning(self):
+        import json
+        from dep_risk.cli import _format_sarif
+        parsed = json.loads(_format_sarif({**SAMPLE_RESULT, "risk_level": "medium"}))
+        assert parsed["runs"][0]["results"][0]["level"] == "warning"
+
+    def test_format_sarif_level_low_maps_to_note(self):
+        import json
+        from dep_risk.cli import _format_sarif
+        parsed = json.loads(_format_sarif({**SAMPLE_RESULT, "risk_level": "low"}))
+        assert parsed["runs"][0]["results"][0]["level"] == "note"
+
+    def test_format_sarif_critical_maps_to_error(self):
+        import json
+        from dep_risk.cli import _format_sarif
+        parsed = json.loads(_format_sarif({**SAMPLE_RESULT, "risk_level": "critical"}))
+        assert parsed["runs"][0]["results"][0]["level"] == "error"
+
+    def test_analyze_help_shows_format_option(self):
+        runner = CliRunner()
+        result = runner.invoke(main, ["analyze", "--help"])
+        assert "--format" in result.output
