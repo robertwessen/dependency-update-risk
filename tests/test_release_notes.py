@@ -1,8 +1,13 @@
 """Tests for release notes fetcher."""
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
+from dep_risk.config import Config
+from dep_risk.models import AffectedPackage, Ecosystem
 from dep_risk.release_notes import (
+    ReleaseNotesFetcher,
     _extract_github_info,
     _parse_version,
     _version_in_range,
@@ -88,3 +93,39 @@ class TestExtractGitHubInfo:
     def test_non_github_url(self):
         result = _extract_github_info("https://gitlab.com/owner/repo")
         assert result is None
+
+
+class TestFetch:
+    """Tests for ReleaseNotesFetcher.fetch() concurrent execution."""
+
+    @pytest.mark.asyncio
+    async def test_exception_in_one_package_does_not_affect_others(self):
+        config = Config()
+        fetcher = ReleaseNotesFetcher(config)
+
+        pkg_ok = AffectedPackage(
+            ecosystem=Ecosystem.PYPI, name="requests", affected_versions=[], fixed_versions=[]
+        )
+        pkg_fail = AffectedPackage(
+            ecosystem=Ecosystem.PYPI, name="broken", affected_versions=[], fixed_versions=[]
+        )
+
+        async def mock_fetch(pkg, start_version=None, end_version=None):
+            if pkg.name == "broken":
+                raise RuntimeError("network error")
+            return []
+
+        with patch.object(fetcher, "fetch_for_package", side_effect=mock_fetch):
+            results = await fetcher.fetch([pkg_ok, pkg_fail])
+
+        assert "requests" in results
+        assert results["requests"] == []
+        assert "broken" in results
+        assert results["broken"] == []
+
+    @pytest.mark.asyncio
+    async def test_empty_package_list_returns_empty_dict(self):
+        config = Config()
+        fetcher = ReleaseNotesFetcher(config)
+        results = await fetcher.fetch([])
+        assert results == {}

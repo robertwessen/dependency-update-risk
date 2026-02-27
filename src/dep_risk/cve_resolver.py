@@ -117,29 +117,59 @@ class CVEResolver:
             await self._client.aclose()
 
     async def _fetch_nvd(self, cve_id: str) -> Optional[dict]:
-        """Fetch CVE data from NVD API."""
+        """Fetch CVE data from NVD API with retry on 429 rate limiting."""
         if self.cache and self.config.use_cache:
             cached = self.cache.get("nvd", cve_id)
             if cached:
                 logger.debug(f"Using cached NVD data for {cve_id}")
                 return cached
 
-        logger.debug(f"Fetching NVD data for {cve_id}")
-        try:
-            response = await self._client.get(NVD_API_URL, params={"cveId": cve_id})
-            response.raise_for_status()
-            data = response.json()
+        headers = {}
+        if self.config.nvd_api_key:
+            headers["apiKey"] = self.config.nvd_api_key
 
-            if self.cache:
-                self.cache.set("nvd", cve_id, data)
+        max_retries = 3
+        for attempt in range(max_retries):
+            logger.debug(f"Fetching NVD data for {cve_id} (attempt {attempt + 1})")
+            try:
+                response = await self._client.get(
+                    NVD_API_URL, params={"cveId": cve_id}, headers=headers
+                )
 
-            return data
-        except httpx.HTTPStatusError as e:
-            logger.warning(f"NVD API error for {cve_id}: {e.response.status_code}")
-            return None
-        except httpx.RequestError as e:
-            logger.warning(f"NVD API request failed for {cve_id}: {e}")
-            return None
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After", "30")
+                    try:
+                        wait_seconds = float(retry_after)
+                    except ValueError:
+                        wait_seconds = 30.0
+                    wait_seconds = min(wait_seconds, 60.0)
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"NVD rate limit hit for {cve_id}, retrying in {wait_seconds:.0f}s "
+                            f"(attempt {attempt + 1}/{max_retries})"
+                        )
+                        await asyncio.sleep(wait_seconds)
+                        continue
+                    else:
+                        logger.warning(f"NVD rate limit exceeded for {cve_id} after {max_retries} attempts")
+                        return None
+
+                response.raise_for_status()
+                data = response.json()
+
+                if self.cache:
+                    self.cache.set("nvd", cve_id, data)
+
+                return data
+
+            except httpx.HTTPStatusError as e:
+                logger.warning(f"NVD API error for {cve_id}: {e.response.status_code}")
+                return None
+            except httpx.RequestError as e:
+                logger.warning(f"NVD API request failed for {cve_id}: {e}")
+                return None
+
+        return None
 
     async def _fetch_osv(self, cve_id: str) -> Optional[dict]:
         """Fetch CVE data from OSV API."""

@@ -497,18 +497,18 @@ class ReleaseNotesFetcher:
         """Fetch release notes for multiple packages."""
         results = {}
 
-        tasks = []
-        for package in packages:
-            task = self.fetch_for_package(package, start_version, end_version)
-            tasks.append((package.name, task))
-
-        for name, task in tasks:
-            try:
-                notes = await task
-                results[name] = notes
-            except Exception as e:
-                logger.warning(f"Failed to fetch release notes for {name}: {e}")
+        package_names = [pkg.name for pkg in packages]
+        coroutines = [
+            self.fetch_for_package(pkg, start_version, end_version)
+            for pkg in packages
+        ]
+        gathered = await asyncio.gather(*coroutines, return_exceptions=True)
+        for name, result in zip(package_names, gathered):
+            if isinstance(result, Exception):
+                logger.warning(f"Failed to fetch release notes for {name}: {result}")
                 results[name] = []
+            else:
+                results[name] = result
 
         return results
 

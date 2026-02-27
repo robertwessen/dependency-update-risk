@@ -3,6 +3,7 @@
 import json
 import logging
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -17,6 +18,19 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_api_url(base_url: str) -> str:
+    """Normalize API URL to end with /v1/chat/completions."""
+    parsed = urlparse(base_url)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/v1/chat/completions") or path.endswith("chat/completions"):
+        return base_url.rstrip("/")
+    elif path.endswith("/v1"):
+        return base_url.rstrip("/") + "/chat/completions"
+    else:
+        return base_url.rstrip("/") + "/v1/chat/completions"
+
 
 SYSTEM_PROMPT = """You are an expert software engineer analyzing dependency updates for breaking changes.
 
@@ -211,9 +225,7 @@ Please analyze these release notes and provide a breaking change risk assessment
             raise ValueError("LLM API key is required. Set --api-key or DEP_RISK_API_KEY")
 
         # Build API URL
-        api_url = self.config.api_url.rstrip("/")
-        if not api_url.endswith("/v1/chat/completions"):
-            api_url = f"{api_url}/v1/chat/completions"
+        api_url = _normalize_api_url(self.config.api_url)
 
         prompt = self._build_prompt(
             cve_info, package, release_notes, current_version, target_version

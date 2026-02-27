@@ -25,6 +25,7 @@ class Config:
     debug: bool = False
     max_context_tokens: int = 8192
     github_token: Optional[str] = None
+    nvd_api_key: Optional[str] = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -34,6 +35,7 @@ class Config:
             api_key=os.environ.get("DEP_RISK_API_KEY", ""),
             model=os.environ.get("DEP_RISK_MODEL", "gpt-4"),
             github_token=os.environ.get("GITHUB_TOKEN"),
+            nvd_api_key=os.environ.get("DEP_RISK_NVD_API_KEY"),
         )
 
     def with_overrides(
@@ -46,6 +48,7 @@ class Config:
         verbose: bool = False,
         debug: bool = False,
         max_context_tokens: Optional[int] = None,
+        nvd_api_key: Optional[str] = None,
     ) -> "Config":
         """Return a new config with CLI overrides applied."""
         return Config(
@@ -58,6 +61,7 @@ class Config:
             debug=debug or self.debug,
             max_context_tokens=max_context_tokens if max_context_tokens is not None else self.max_context_tokens,
             github_token=self.github_token,
+            nvd_api_key=nvd_api_key or self.nvd_api_key,
         )
 
 

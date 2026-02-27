@@ -32,25 +32,29 @@ def setup_logging(verbose: bool) -> None:
     )
 
 
-def _get_previous_version(fixed_version: str) -> str:
-    """Estimate the version before the fix (N-1)."""
-    import re
+_RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
-    # Try to decrement the patch version
-    match = re.match(r"^(\d+)\.(\d+)\.(\d+)(.*)$", fixed_version)
-    if match:
-        major, minor, patch, suffix = match.groups()
-        patch = int(patch)
-        if patch > 0:
-            return f"{major}.{minor}.{patch - 1}"
-        else:
-            # Patch is 0, try to decrement minor
-            minor = int(minor)
-            if minor > 0:
-                return f"{major}.{minor - 1}.0"
 
-    # Fall back to just returning the same version with a note
-    return fixed_version
+def _check_exit_risk(actual_risk: str, threshold: str) -> bool:
+    """Return True if actual_risk meets or exceeds threshold."""
+    return _RISK_ORDER.get(actual_risk.lower(), -1) >= _RISK_ORDER.get(threshold.lower(), 999)
+
+
+def _estimate_previous_version(fixed_version: str) -> tuple[Optional[str], bool]:
+    """Returns (estimated_version, is_ambiguous). None means no reliable estimate."""
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        v = Version(fixed_version)
+    except InvalidVersion:
+        return None, True
+    major, minor, micro = v.major, v.minor, v.micro
+    if micro > 0:
+        return f"{major}.{minor}.{micro - 1}", False  # unambiguous
+    elif minor > 0:
+        return f"{major}.{minor - 1}.0", True  # plausible lower bound
+    else:
+        return None, True  # X.0.0 — can't reliably guess
 
 
 @click.group()
@@ -127,6 +131,17 @@ def main() -> None:
     is_flag=True,
     help="Output only JSON, no rich formatting",
 )
+@click.option(
+    "--nvd-api-key",
+    envvar="DEP_RISK_NVD_API_KEY",
+    help="NVD API key for higher rate limits (https://nvd.nist.gov/developers/request-an-api-key)",
+)
+@click.option(
+    "--min-exit-risk",
+    type=click.Choice(["high", "critical"], case_sensitive=False),
+    default=None,
+    help="Exit with code 1 if risk level meets or exceeds this threshold (for CI use)",
+)
 def analyze(
     cve_id: str,
     current_version: Optional[str],
@@ -141,6 +156,8 @@ def analyze(
     max_context: int,
     package: Optional[str],
     json_only: bool,
+    nvd_api_key: Optional[str],
+    min_exit_risk: Optional[str],
 ) -> None:
     """Analyze breaking change risk for a CVE security update.
 
@@ -160,6 +177,7 @@ def analyze(
         verbose=verbose,
         debug=debug,
         max_context_tokens=max_context,
+        nvd_api_key=nvd_api_key,
     )
 
     # Initialize cache
@@ -217,9 +235,26 @@ def analyze(
         target_version = (
             target_package.fixed_versions[0] if target_package.fixed_versions else "unknown"
         )
+        version_is_ambiguous = False
         if not current_version:
             if target_package.fixed_versions:
-                current_version = _get_previous_version(target_package.fixed_versions[0])
+                estimated, version_is_ambiguous = _estimate_previous_version(
+                    target_package.fixed_versions[0]
+                )
+                if estimated is None:
+                    if not json_only:
+                        console.print(
+                            f"[bold yellow]Warning:[/bold yellow] Cannot estimate previous version for "
+                            f"{target_package.fixed_versions[0]} (likely a major version boundary). "
+                            f"Use --version to specify your current version."
+                        )
+                    current_version = "unknown"
+                else:
+                    current_version = estimated
+                    if version_is_ambiguous and not json_only:
+                        console.print(
+                            f"[dim]Note: Version {current_version} is an estimate. Use --version for accuracy.[/dim]"
+                        )
             else:
                 current_version = "unknown"
 
@@ -297,7 +332,20 @@ def analyze(
             console.print("\n")
             _print_rich_results(result)
 
-    asyncio.run(run_analysis())
+        return result
+
+    result = asyncio.run(run_analysis())
+
+    # CI exit code: exit 1 if risk meets or exceeds threshold
+    if min_exit_risk and result:
+        actual_risk = result.get("risk_level", "")
+        if _check_exit_risk(actual_risk, min_exit_risk):
+            if not json_only:
+                console.print(
+                    f"[bold red]Exiting with code 1:[/bold red] risk level "
+                    f"[bold]{actual_risk}[/bold] meets --min-exit-risk threshold ({min_exit_risk})"
+                )
+            sys.exit(1)
 
 
 def _print_rich_results(result: dict) -> None:
