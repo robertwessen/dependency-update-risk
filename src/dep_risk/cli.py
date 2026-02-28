@@ -162,6 +162,8 @@ def _format_sarif(result: dict) -> str:
 
 def _check_exit_risk(actual_risk: str, threshold: str) -> bool:
     """Return True if actual_risk meets or exceeds threshold."""
+    if not isinstance(actual_risk, str) or not isinstance(threshold, str):
+        return False
     return _RISK_ORDER.get(actual_risk.lower(), -1) >= _RISK_ORDER.get(threshold.lower(), 999)
 
 
@@ -213,9 +215,15 @@ def _parse_scanner_input(path_or_data: "str | dict") -> list[ScannerFinding]:
     """
     if isinstance(path_or_data, dict):
         data = path_or_data
+    elif isinstance(path_or_data, str):
+        try:
+            with open(path_or_data) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+            return []
     else:
-        with open(path_or_data) as f:
-            data = json.load(f)
+        # Non-str / non-dict input (None, int, list, …) — gracefully return empty
+        return []
 
     if not isinstance(data, dict):
         return []
@@ -227,9 +235,13 @@ def _parse_scanner_input(path_or_data: "str | dict") -> list[ScannerFinding]:
     #               "PkgName": "requests", "InstalledVersion": "2.27.0"}]}]}
     if "Results" in data:
         for result in data.get("Results") or []:
+            if not isinstance(result, dict):
+                continue
             for vuln in result.get("Vulnerabilities") or []:
-                vid = vuln.get("VulnerabilityID", "")
-                if vid.upper().startswith("CVE-"):
+                if not isinstance(vuln, dict):
+                    continue
+                vid = vuln.get("VulnerabilityID") or ""
+                if vid and vid.upper().startswith("CVE-"):
                     findings.append(
                         ScannerFinding(
                             cve_id=vid,
@@ -245,20 +257,29 @@ def _parse_scanner_input(path_or_data: "str | dict") -> list[ScannerFinding]:
     #               "artifact": {"name": "requests", "version": "2.27.0", "type": "python"}}]}
     elif "matches" in data:
         for match in data.get("matches") or []:
-            artifact = match.get("artifact", {})
+            if not isinstance(match, dict):
+                continue
+            artifact = match.get("artifact") or {}
+            if not isinstance(artifact, dict):
+                artifact = {}
             pkg_name = artifact.get("name") or None
             pkg_version = artifact.get("version") or None
             pkg_type = (artifact.get("type") or "").lower()
             ecosystem = _GRYPE_TYPE_TO_ECOSYSTEM.get(pkg_type)
 
-            vid = match.get("vulnerability", {}).get("id", "")
+            vuln_block = match.get("vulnerability") or {}
+            if not isinstance(vuln_block, dict):
+                vuln_block = {}
+            vid = vuln_block.get("id") or ""
             cve_found: Optional[str] = None
-            if vid.upper().startswith("CVE-"):
+            if vid and vid.upper().startswith("CVE-"):
                 cve_found = vid
             else:
                 for related in match.get("relatedVulnerabilities") or []:
-                    rid = related.get("id", "")
-                    if rid.upper().startswith("CVE-"):
+                    if not isinstance(related, dict):
+                        continue
+                    rid = related.get("id") or ""
+                    if rid and rid.upper().startswith("CVE-"):
                         cve_found = rid
                         break
 
@@ -279,19 +300,29 @@ def _parse_scanner_input(path_or_data: "str | dict") -> list[ScannerFinding]:
     #               "vulnerabilities": [{"id": "GHSA-...", "aliases": ["CVE-..."]}]}]}]}
     elif "results" in data:
         for result in data.get("results") or []:
+            if not isinstance(result, dict):
+                continue
             for pkg_entry in result.get("packages") or []:
-                pkg_info = pkg_entry.get("package", {})
+                if not isinstance(pkg_entry, dict):
+                    continue
+                pkg_info = pkg_entry.get("package") or {}
+                if not isinstance(pkg_info, dict):
+                    pkg_info = {}
                 pkg_name = pkg_info.get("name") or None
                 pkg_version = pkg_info.get("version") or None
                 ecosystem = pkg_info.get("ecosystem") or None
 
                 for vuln in pkg_entry.get("vulnerabilities") or []:
-                    vid = vuln.get("id", "")
+                    if not isinstance(vuln, dict):
+                        continue
+                    vid = vuln.get("id") or ""
                     cve_found = None
-                    if vid.upper().startswith("CVE-"):
+                    if vid and vid.upper().startswith("CVE-"):
                         cve_found = vid
                     else:
                         for alias in vuln.get("aliases") or []:
+                            if not isinstance(alias, str):
+                                continue
                             if alias.upper().startswith("CVE-"):
                                 cve_found = alias
                                 break
@@ -388,9 +419,14 @@ def _parse_cyclonedx(data: dict) -> list[tuple[str, str, str]]:
     cdxgen is the common enterprise case.
     """
     packages: list[tuple[str, str, str]] = []
-    for component in data.get("components") or []:
+    components = data.get("components")
+    if not isinstance(components, list):
+        return packages
+    for component in components:
+        if not isinstance(component, dict):
+            continue
         purl = component.get("purl")
-        if purl:
+        if purl and isinstance(purl, str):
             parsed = _parse_purl(purl)
             if parsed:
                 packages.append(parsed)
@@ -405,11 +441,21 @@ def _parse_spdx(data: dict) -> list[tuple[str, str, str]]:
     valid PURL.  The first valid PURL per package wins; duplicates are skipped.
     """
     packages: list[tuple[str, str, str]] = []
-    for pkg in data.get("packages") or []:
-        for ref in pkg.get("externalRefs") or []:
+    raw_pkgs = data.get("packages")
+    if not isinstance(raw_pkgs, list):
+        return packages
+    for pkg in raw_pkgs:
+        if not isinstance(pkg, dict):
+            continue
+        ext_refs = pkg.get("externalRefs")
+        if not isinstance(ext_refs, list):
+            continue
+        for ref in ext_refs:
+            if not isinstance(ref, dict):
+                continue
             if ref.get("referenceCategory") == "PACKAGE-MANAGER":
-                locator = ref.get("referenceLocator", "")
-                if locator.startswith("pkg:"):
+                locator = ref.get("referenceLocator") or ""
+                if isinstance(locator, str) and locator.startswith("pkg:"):
                     parsed = _parse_purl(locator)
                     if parsed:
                         packages.append(parsed)
@@ -706,8 +752,25 @@ def analyze(
     # Build list of items to process — always ScannerFinding objects so the package
     # name and installed version are available throughout the analysis loop.
     if input_file:
-        with open(input_file) as _f:
-            _raw = json.load(_f)
+        try:
+            with open(input_file) as _f:
+                _raw = json.load(_f)
+        except FileNotFoundError:
+            console.print(f"[bold red]Error:[/bold red] Input file not found: {input_file}")
+            raise SystemExit(1)
+        except (json.JSONDecodeError, ValueError) as exc:
+            console.print(f"[bold red]Error:[/bold red] Input file is not valid JSON: {exc}")
+            raise SystemExit(1)
+        except (UnicodeDecodeError, OSError) as exc:
+            console.print(f"[bold red]Error:[/bold red] Cannot read input file: {exc}")
+            raise SystemExit(1)
+
+        if not isinstance(_raw, dict):
+            console.print(
+                f"[bold red]Error:[/bold red] Input file must contain a JSON object, "
+                f"got {type(_raw).__name__}."
+            )
+            raise SystemExit(1)
 
         sbom_format = _detect_sbom_format(_raw)
         if sbom_format:

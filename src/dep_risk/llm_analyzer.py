@@ -140,11 +140,15 @@ def _parse_llm_response(response_text: str) -> dict:
     text = text.strip()
 
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and parsed:
+            return parsed
+        # LLM returned valid JSON but not a usable object (empty dict, array, scalar) — fall through
+        logger.warning(f"LLM response parsed as {type(parsed).__name__}, expected dict; using fallback")
     except json.JSONDecodeError as e:
         logger.warning(f"Failed to parse LLM response as JSON: {e}")
-        # Return a default structure
-        return {
+    # Return a default structure
+    return {
             "risk_level": "medium",
             "confidence": 0.3,
             "breaking_changes": [],

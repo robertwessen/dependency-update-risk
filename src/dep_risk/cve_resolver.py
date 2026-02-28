@@ -34,14 +34,21 @@ def _parse_ecosystem(ecosystem_str: str) -> Ecosystem:
 
 def _extract_severity(nvd_data: dict) -> tuple[Severity, Optional[float]]:
     """Extract severity and CVSS score from NVD data."""
-    metrics = nvd_data.get("metrics", {})
+    metrics = nvd_data.get("metrics") or {}
+    if not isinstance(metrics, dict):
+        return Severity.UNKNOWN, None
 
     # Try CVSS 3.1 first, then 3.0, then 2.0
     for cvss_key in ["cvssMetricV31", "cvssMetricV30", "cvssMetricV2"]:
         if cvss_key in metrics and metrics[cvss_key]:
-            cvss_data = metrics[cvss_key][0].get("cvssData", {})
+            entry = metrics[cvss_key][0]
+            if not isinstance(entry, dict):
+                continue
+            cvss_data = entry.get("cvssData") or {}
+            if not isinstance(cvss_data, dict):
+                continue
             score = cvss_data.get("baseScore")
-            severity_str = cvss_data.get("baseSeverity", "").upper()
+            severity_str = (cvss_data.get("baseSeverity") or "").upper()
 
             try:
                 severity = Severity(severity_str)
@@ -56,11 +63,17 @@ def _extract_severity(nvd_data: dict) -> tuple[Severity, Optional[float]]:
 def _extract_packages_from_nvd(nvd_data: dict) -> list[AffectedPackage]:
     """Extract affected packages from NVD configurations."""
     packages = []
-    configurations = nvd_data.get("configurations", [])
+    configurations = nvd_data.get("configurations") or []
+    if not isinstance(configurations, list):
+        return packages
 
     for config in configurations:
-        for node in config.get("nodes", []):
-            for cpe_match in node.get("cpeMatch", []):
+        if not isinstance(config, dict):
+            continue
+        for node in config.get("nodes") or []:
+            if not isinstance(node, dict):
+                continue
+            for cpe_match in node.get("cpeMatch") or []:
                 if not cpe_match.get("vulnerable", False):
                     continue
 
