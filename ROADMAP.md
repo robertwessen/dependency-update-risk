@@ -213,7 +213,7 @@ When dep-risk analyzes a CVE that affects packages in unsupported ecosystems (Ru
 
 ---
 
-## #18 — CycloneDX and SPDX SBOM input support (`--input sbom.json`)
+## ~~#18 — CycloneDX and SPDX SBOM input support (`--input sbom.json`)~~ ✅ Done
 **Impact:** High | **Effort:** High
 **Source:** AppSec evaluation P2 — feature gap; primary enterprise SCA output format not supported
 

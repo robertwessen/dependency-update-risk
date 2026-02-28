@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import click
+import httpx
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
@@ -183,17 +184,35 @@ _GRYPE_TYPE_TO_ECOSYSTEM: dict[str, str] = {
     "rpm": "RPM",
 }
 
+# PURL type → OSV/dep-risk ecosystem string (used for CycloneDX + SPDX SBOM parsing)
+_PURL_TYPE_TO_ECOSYSTEM: dict[str, str] = {
+    "pypi": "PyPI",
+    "npm": "npm",
+    "maven": "Maven",
+    "cargo": "crates.io",
+    "golang": "Go",
+    "nuget": "NuGet",
+    "gem": "RubyGems",
+    "composer": "Packagist",
+}
 
-def _parse_scanner_input(path: str) -> list[ScannerFinding]:
+
+def _parse_scanner_input(path_or_data: "str | dict") -> list[ScannerFinding]:
     """Extract CVE findings (with package context) from Trivy, Grype, or OSV-Scanner JSON.
+
+    Accepts either a file path (str) or an already-parsed dict so the caller can
+    avoid reading the file twice when format-detection has already loaded the JSON.
 
     Each ScannerFinding carries the CVE ID plus the package name and installed version
     reported by the scanner, so dep-risk can (a) filter to the correct affected package
     in the CVE database and (b) use the scanner-reported version as the current version
     without requiring the user to pass --version manually.
     """
-    with open(path) as f:
-        data = json.load(f)
+    if isinstance(path_or_data, dict):
+        data = path_or_data
+    else:
+        with open(path_or_data) as f:
+            data = json.load(f)
 
     if not isinstance(data, dict):
         return []
@@ -288,6 +307,178 @@ def _parse_scanner_input(path: str) -> list[ScannerFinding]:
     seen: set[tuple] = set()
     unique: list[ScannerFinding] = []
     for f in findings:
+        key = (f.cve_id, f.package_name)
+        if key not in seen:
+            seen.add(key)
+            unique.append(f)
+    return unique
+
+
+def _parse_purl(purl: str) -> "tuple[str, str, str] | None":
+    """Parse a Package URL (PURL) into (ecosystem, name, version) or None.
+
+    Handles: pkg:type/[namespace/]name@version[?qualifiers][#subpath]
+    Ref: https://github.com/package-url/purl-spec
+
+    Returns None for unknown types, missing versions, or malformed PURLs.
+    No external dependencies — uses only stdlib urllib.parse.unquote.
+    """
+    from urllib.parse import unquote
+
+    if not purl or not purl.startswith("pkg:"):
+        return None
+
+    # Strip qualifiers (?...) and subpath (#...)
+    rest = purl[4:]  # drop "pkg:"
+    rest = rest.split("?")[0].split("#")[0]
+
+    if "/" not in rest:
+        return None
+
+    pkg_type, remainder = rest.split("/", 1)
+
+    ecosystem = _PURL_TYPE_TO_ECOSYSTEM.get(pkg_type.lower())
+    if ecosystem is None:
+        return None
+
+    # Version is required — separated from path by the last '@'
+    if "@" not in remainder:
+        return None
+    path, version = remainder.rsplit("@", 1)
+    if not version:
+        return None
+
+    # URL-decode percent-encoded characters (e.g. %40 → @, %2F → /)
+    path = unquote(path)
+    version = unquote(version)
+
+    # Derive canonical name per ecosystem
+    if pkg_type.lower() == "maven":
+        # path = "groupId/artifactId" → dep-risk uses "groupId:artifactId"
+        parts = path.split("/")
+        name = f"{parts[0]}:{parts[1]}" if len(parts) >= 2 else parts[0]
+    elif pkg_type.lower() == "golang":
+        # Full module path preserved (e.g. "github.com/gin-gonic/gin")
+        name = path
+    else:
+        # pypi, npm (incl. scoped), cargo, nuget, gem, composer — path IS the name
+        name = path
+
+    return ecosystem, name, version
+
+
+def _detect_sbom_format(data: dict) -> "str | None":
+    """Return 'cyclonedx', 'spdx', or None (scanner JSON or unknown)."""
+    if data.get("bomFormat") == "CycloneDX":
+        return "cyclonedx"
+    if "spdxVersion" in data:
+        return "spdx"
+    return None
+
+
+def _parse_cyclonedx(data: dict) -> list[tuple[str, str, str]]:
+    """Extract (ecosystem, name, version) tuples from a CycloneDX JSON SBOM.
+
+    Parses top-level ``components[].purl``. Skips components without a PURL
+    or with an unrecognised PURL type.  Nested ``components[].components``
+    (dependency-tree format) are not traversed — flat SBOM output from Syft /
+    cdxgen is the common enterprise case.
+    """
+    packages: list[tuple[str, str, str]] = []
+    for component in data.get("components") or []:
+        purl = component.get("purl")
+        if purl:
+            parsed = _parse_purl(purl)
+            if parsed:
+                packages.append(parsed)
+    return packages
+
+
+def _parse_spdx(data: dict) -> list[tuple[str, str, str]]:
+    """Extract (ecosystem, name, version) tuples from an SPDX JSON SBOM.
+
+    Inspects ``packages[].externalRefs`` for entries where
+    ``referenceCategory == "PACKAGE-MANAGER"`` and ``referenceLocator`` is a
+    valid PURL.  The first valid PURL per package wins; duplicates are skipped.
+    """
+    packages: list[tuple[str, str, str]] = []
+    for pkg in data.get("packages") or []:
+        for ref in pkg.get("externalRefs") or []:
+            if ref.get("referenceCategory") == "PACKAGE-MANAGER":
+                locator = ref.get("referenceLocator", "")
+                if locator.startswith("pkg:"):
+                    parsed = _parse_purl(locator)
+                    if parsed:
+                        packages.append(parsed)
+                        break  # first valid PURL per package
+    return packages
+
+
+async def _query_osv_batch(
+    packages: list[tuple[str, str, str]],
+) -> list[ScannerFinding]:
+    """Query OSV /v1/querybatch to find CVEs for a list of (ecosystem, name, version) tuples.
+
+    Results are deduplicated on (cve_id, package_name).  HTTP errors are logged
+    as warnings and return an empty list — they do not propagate as exceptions.
+
+    Sends requests in chunks of 500 (OSV hard limit is 1000; half used for safety).
+    """
+    if not packages:
+        return []
+
+    _logger = logging.getLogger(__name__)
+    _OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
+    _CHUNK_SIZE = 500
+
+    all_findings: list[ScannerFinding] = []
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for chunk_start in range(0, len(packages), _CHUNK_SIZE):
+            chunk = packages[chunk_start : chunk_start + _CHUNK_SIZE]
+            queries = [
+                {"package": {"name": name, "ecosystem": ecosystem}, "version": version}
+                for ecosystem, name, version in chunk
+            ]
+            try:
+                resp = await client.post(_OSV_BATCH_URL, json={"queries": queries})
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                _logger.warning(
+                    f"OSV querybatch HTTP error {e.response.status_code}: {e}"
+                )
+                continue
+            except httpx.RequestError as e:
+                _logger.warning(f"OSV querybatch request error: {e}")
+                continue
+
+            results = resp.json().get("results") or []
+            for (ecosystem, name, version), result in zip(chunk, results):
+                for vuln in result.get("vulns") or []:
+                    # Extract CVE ID from primary id or aliases list
+                    cve_id: Optional[str] = None
+                    vid = vuln.get("id", "")
+                    if vid.upper().startswith("CVE-"):
+                        cve_id = vid
+                    else:
+                        for alias in vuln.get("aliases") or []:
+                            if alias.upper().startswith("CVE-"):
+                                cve_id = alias
+                                break
+                    if cve_id:
+                        all_findings.append(
+                            ScannerFinding(
+                                cve_id=cve_id,
+                                package_name=name,
+                                package_version=version,
+                                ecosystem=ecosystem,
+                            )
+                        )
+
+    # Deduplicate on (cve_id, package_name) — preserve first-seen order
+    seen: set[tuple] = set()
+    unique: list[ScannerFinding] = []
+    for f in all_findings:
         key = (f.cve_id, f.package_name)
         if key not in seen:
             seen.add(key)
@@ -430,7 +621,7 @@ def main() -> None:
     "--input",
     "input_file",
     type=click.Path(exists=True),
-    help="Scanner JSON file (Trivy, Grype, or OSV-Scanner output) — analyze all CVEs found",
+    help="Scanner JSON (Trivy/Grype/OSV-Scanner) or SBOM (CycloneDX/SPDX JSON) — analyze all CVEs found",
 )
 @click.option(
     "--no-llm",
@@ -475,14 +666,53 @@ def analyze(
     # Build list of items to process — always ScannerFinding objects so the package
     # name and installed version are available throughout the analysis loop.
     if input_file:
-        items_to_process = _parse_scanner_input(input_file)
-        if not items_to_process:
-            console.print("[bold yellow]Warning:[/bold yellow] No CVE IDs found in scanner input file.")
-            return
-        if output_format == "rich" and len(items_to_process) > 1:
-            console.print(
-                f"[bold blue]Found {len(items_to_process)} CVE findings in scanner output.[/bold blue]"
+        with open(input_file) as _f:
+            _raw = json.load(_f)
+
+        sbom_format = _detect_sbom_format(_raw)
+        if sbom_format:
+            # ── SBOM input (CycloneDX / SPDX) ─────────────────────────────────
+            # Parse the SBOM to get (ecosystem, name, version) tuples, then query
+            # OSV querybatch to discover which packages have known CVEs.
+            sbom_packages = (
+                _parse_cyclonedx(_raw) if sbom_format == "cyclonedx" else _parse_spdx(_raw)
             )
+            if not sbom_packages:
+                console.print(
+                    f"[bold yellow]Warning:[/bold yellow] No packages with recognised PURLs "
+                    f"found in {sbom_format.upper()} SBOM."
+                )
+                return
+            if output_format == "rich":
+                console.print(
+                    f"[bold blue]Found {len(sbom_packages)} packages in "
+                    f"{sbom_format.upper()} SBOM. Querying OSV for CVEs...[/bold blue]"
+                )
+            items_to_process = asyncio.run(_query_osv_batch(sbom_packages))
+            if not items_to_process:
+                console.print(
+                    "[bold yellow]No CVEs found for any packages in the SBOM.[/bold yellow]"
+                )
+                return
+            if output_format == "rich":
+                pkg_count = len({f.package_name for f in items_to_process})
+                console.print(
+                    f"[bold blue]Found {len(items_to_process)} CVE findings "
+                    f"across {pkg_count} package(s).[/bold blue]"
+                )
+        else:
+            # ── Scanner input (Trivy / Grype / OSV-Scanner) ───────────────────
+            items_to_process = _parse_scanner_input(_raw)
+            if not items_to_process:
+                console.print(
+                    "[bold yellow]Warning:[/bold yellow] No CVE IDs found in scanner input file."
+                )
+                return
+            if output_format == "rich" and len(items_to_process) > 1:
+                console.print(
+                    f"[bold blue]Found {len(items_to_process)} CVE findings "
+                    f"in scanner output.[/bold blue]"
+                )
     else:
         items_to_process = [ScannerFinding(cve_id=cve_id)]
 
