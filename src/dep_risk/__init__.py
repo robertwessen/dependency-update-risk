@@ -1,3 +1,3 @@
 """Dependency Update Risk Analyzer - Analyze breaking change risk for security updates."""
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
