@@ -255,3 +255,86 @@ class TestMavenReleases:
 
         assert len(notes) == 1
         assert notes[0].source == "GitHub Releases"
+
+
+class TestGoReleases:
+    """Tests for Go module release note fetching."""
+
+    @pytest.mark.asyncio
+    async def test_uses_github_when_module_path_is_github(self):
+        from unittest.mock import patch
+        from dep_risk.config import Config
+        from dep_risk.models import ReleaseNote
+        from dep_risk.release_notes import ReleaseNotesFetcher
+
+        config = Config()
+        fetcher = ReleaseNotesFetcher(config)
+
+        github_note = ReleaseNote(
+            version="1.5.0", content="GitHub release", source="GitHub Releases"
+        )
+        with patch.object(fetcher, "_fetch_github_releases", return_value=[github_note]):
+            notes = await fetcher._fetch_go_releases(
+                "github.com/gin-gonic/gin", "1.4.0", "1.5.0"
+            )
+
+        assert len(notes) == 1
+        assert notes[0].source == "GitHub Releases"
+
+    @pytest.mark.asyncio
+    async def test_fetches_from_proxy_when_not_github(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from dep_risk.config import Config
+        from dep_risk.release_notes import ReleaseNotesFetcher
+
+        config = Config()
+        fetcher = ReleaseNotesFetcher(config)
+
+        proxy_response = MagicMock()
+        proxy_response.status_code = 200
+        proxy_response.text = "v1.4.0\nv1.5.0\nv1.6.0\n"
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=proxy_response)
+        fetcher._client = mock_client
+
+        notes = await fetcher._fetch_go_releases(
+            "golang.org/x/crypto", "1.4.0", "1.6.0"
+        )
+
+        # 1.5.0 and 1.6.0 in range; 1.4.0 excluded (start is exclusive)
+        assert len(notes) == 2
+        assert all(n.source == "pkg.go.dev" for n in notes)
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_404(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from dep_risk.config import Config
+        from dep_risk.release_notes import ReleaseNotesFetcher
+
+        config = Config()
+        fetcher = ReleaseNotesFetcher(config)
+
+        not_found = MagicMock()
+        not_found.status_code = 404
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=not_found)
+        fetcher._client = mock_client
+
+        notes = await fetcher._fetch_go_releases("golang.org/x/nonexistent")
+        assert notes == []
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_request_error(self):
+        from unittest.mock import AsyncMock
+        import httpx
+        from dep_risk.config import Config
+        from dep_risk.release_notes import ReleaseNotesFetcher
+
+        config = Config()
+        fetcher = ReleaseNotesFetcher(config)
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=httpx.RequestError("timeout"))
+        fetcher._client = mock_client
+
+        notes = await fetcher._fetch_go_releases("golang.org/x/crypto")
+        assert notes == []

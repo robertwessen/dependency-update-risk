@@ -612,6 +612,73 @@ class ReleaseNotesFetcher:
         )
         return []
 
+    async def _fetch_go_releases(
+        self,
+        package_name: str,
+        start_version: Optional[str] = None,
+        end_version: Optional[str] = None,
+    ) -> list[ReleaseNote]:
+        """Fetch release notes for Go modules via proxy.golang.org and GitHub fast-path."""
+        # Fast-path: Go module paths often embed github.com/owner/repo
+        if package_name.startswith("github.com/"):
+            parts = package_name.split("/")
+            if len(parts) >= 3:
+                owner, repo = parts[1], parts[2]
+                github_notes = await self._fetch_github_releases(
+                    owner, repo, start_version, end_version
+                )
+                if github_notes:
+                    return github_notes
+                changelog = await self._fetch_github_changelog(owner, repo)
+                if changelog:
+                    changelog_notes = self._parse_changelog(changelog, start_version, end_version)
+                    if changelog_notes:
+                        return changelog_notes
+
+        # Fallback: proxy.golang.org version list
+        cache_key = f"go_{package_name.replace('/', '_')}"
+        if self.cache and self.config.use_cache:
+            cached = self.cache.get("releases", cache_key)
+            versions = cached if cached else None
+        else:
+            versions = None
+
+        if versions is None:
+            logger.debug(f"Fetching Go proxy data for {package_name}")
+            try:
+                response = await self._client.get(
+                    f"https://proxy.golang.org/{package_name}/@v/list"
+                )
+                if response.status_code == 404:
+                    return []
+                response.raise_for_status()
+                versions = [v.strip() for v in response.text.strip().splitlines() if v.strip()]
+                if self.cache:
+                    self.cache.set("releases", cache_key, versions)
+            except httpx.HTTPStatusError as e:
+                logger.warning(f"Go proxy error for {package_name}: {e.response.status_code}")
+                return []
+            except httpx.RequestError as e:
+                logger.warning(f"Go proxy request failed for {package_name}: {e}")
+                return []
+
+        notes = []
+        for version in versions:
+            ver_clean = version.lstrip("v")
+            if not _version_in_range(ver_clean, start_version, end_version):
+                continue
+            notes.append(
+                ReleaseNote(
+                    version=ver_clean,
+                    date=None,
+                    content=f"Release {version}",
+                    source="pkg.go.dev",
+                    url=f"https://pkg.go.dev/{package_name}@{version}",
+                )
+            )
+
+        return notes
+
     async def fetch_for_package(
         self,
         package: AffectedPackage,
@@ -654,6 +721,10 @@ class ReleaseNotesFetcher:
                 )
             elif package.ecosystem == Ecosystem.MAVEN:
                 notes = await self._fetch_maven_releases(
+                    package.name, start_version, end_version
+                )
+            elif package.ecosystem == Ecosystem.GO:
+                notes = await self._fetch_go_releases(
                     package.name, start_version, end_version
                 )
 

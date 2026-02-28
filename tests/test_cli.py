@@ -16,7 +16,7 @@ class TestCLI:
         runner = CliRunner()
         result = runner.invoke(main, ["--version"])
         assert result.exit_code == 0
-        assert "1.1.0" in result.output
+        assert "1.3.0" in result.output
 
     def test_analyze_help(self):
         runner = CliRunner()
@@ -176,3 +176,184 @@ class TestFormatOutput:
         runner = CliRunner()
         result = runner.invoke(main, ["analyze", "--help"])
         assert "--format" in result.output
+
+    def test_analyze_help_shows_input_option(self):
+        runner = CliRunner()
+        result = runner.invoke(main, ["analyze", "--help"])
+        assert "--input" in result.output
+
+
+class TestScannerInput:
+    """Tests for _parse_scanner_input() — scanner JSON parsing."""
+
+    def test_parses_trivy_json(self, tmp_path):
+        import json
+        from dep_risk.cli import _parse_scanner_input
+
+        trivy_data = {
+            "Results": [
+                {
+                    "Vulnerabilities": [
+                        {"VulnerabilityID": "CVE-2024-1234", "PkgName": "requests"},
+                        {"VulnerabilityID": "CVE-2024-5678", "PkgName": "flask"},
+                    ]
+                },
+                {
+                    "Vulnerabilities": [
+                        {"VulnerabilityID": "CVE-2024-9999", "PkgName": "django"},
+                    ]
+                },
+            ]
+        }
+        f = tmp_path / "trivy.json"
+        f.write_text(json.dumps(trivy_data))
+
+        result = _parse_scanner_input(str(f))
+        assert result == ["CVE-2024-1234", "CVE-2024-5678", "CVE-2024-9999"]
+
+    def test_parses_grype_json(self, tmp_path):
+        import json
+        from dep_risk.cli import _parse_scanner_input
+
+        grype_data = {
+            "matches": [
+                {"vulnerability": {"id": "CVE-2024-1111"}, "artifact": {"name": "requests"}},
+                {"vulnerability": {"id": "CVE-2024-2222"}, "artifact": {"name": "flask"}},
+            ]
+        }
+        f = tmp_path / "grype.json"
+        f.write_text(json.dumps(grype_data))
+
+        result = _parse_scanner_input(str(f))
+        assert result == ["CVE-2024-1111", "CVE-2024-2222"]
+
+    def test_parses_osv_scanner_json(self, tmp_path):
+        import json
+        from dep_risk.cli import _parse_scanner_input
+
+        osv_data = {
+            "results": [
+                {
+                    "packages": [
+                        {
+                            "package": {"name": "requests"},
+                            "vulnerabilities": [
+                                {"id": "CVE-2024-3333"},
+                                {"id": "CVE-2024-4444"},
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+        f = tmp_path / "osv.json"
+        f.write_text(json.dumps(osv_data))
+
+        result = _parse_scanner_input(str(f))
+        assert result == ["CVE-2024-3333", "CVE-2024-4444"]
+
+    def test_deduplicates_cve_ids(self, tmp_path):
+        import json
+        from dep_risk.cli import _parse_scanner_input
+
+        trivy_data = {
+            "Results": [
+                {
+                    "Vulnerabilities": [
+                        {"VulnerabilityID": "CVE-2024-1234"},
+                        {"VulnerabilityID": "CVE-2024-1234"},  # duplicate
+                        {"VulnerabilityID": "CVE-2024-5678"},
+                    ]
+                }
+            ]
+        }
+        f = tmp_path / "trivy_dup.json"
+        f.write_text(json.dumps(trivy_data))
+
+        result = _parse_scanner_input(str(f))
+        assert result == ["CVE-2024-1234", "CVE-2024-5678"]
+
+    def test_filters_non_cve_ids(self, tmp_path):
+        import json
+        from dep_risk.cli import _parse_scanner_input
+
+        grype_data = {
+            "matches": [
+                {"vulnerability": {"id": "CVE-2024-1111"}},
+                {"vulnerability": {"id": "GHSA-xxxx-yyyy-zzzz"}},  # GHSA, not CVE
+            ]
+        }
+        f = tmp_path / "grype_mixed.json"
+        f.write_text(json.dumps(grype_data))
+
+        result = _parse_scanner_input(str(f))
+        assert result == ["CVE-2024-1111"]
+
+    def test_empty_vulnerabilities_returns_empty(self, tmp_path):
+        import json
+        from dep_risk.cli import _parse_scanner_input
+
+        trivy_data = {"Results": [{"Vulnerabilities": []}]}
+        f = tmp_path / "trivy_empty.json"
+        f.write_text(json.dumps(trivy_data))
+
+        result = _parse_scanner_input(str(f))
+        assert result == []
+
+    def test_osv_scanner_uses_aliases_when_id_is_ghsa(self, tmp_path):
+        """Real OSV-Scanner output uses GHSA IDs; CVE IDs are in the aliases list."""
+        import json
+        from dep_risk.cli import _parse_scanner_input
+
+        osv_data = {
+            "results": [
+                {
+                    "packages": [
+                        {
+                            "package": {"name": "requests", "version": "2.27.0"},
+                            "vulnerabilities": [
+                                {
+                                    "id": "GHSA-j8r2-6x86-q33q",
+                                    "aliases": ["CVE-2023-32681"],
+                                    "summary": "Certificate verification bypass",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+        f = tmp_path / "osv_real.json"
+        f.write_text(json.dumps(osv_data))
+
+        result = _parse_scanner_input(str(f))
+        assert result == ["CVE-2023-32681"]
+
+    def test_grype_uses_related_vulnerabilities_when_id_is_ghsa(self, tmp_path):
+        """Real Grype output uses GHSA IDs as primary; CVE IDs are in relatedVulnerabilities."""
+        import json
+        from dep_risk.cli import _parse_scanner_input
+
+        grype_data = {
+            "matches": [
+                {
+                    "vulnerability": {
+                        "id": "GHSA-j8r2-6x86-q33q",
+                        "severity": "Medium",
+                    },
+                    "relatedVulnerabilities": [
+                        {
+                            "id": "CVE-2023-32681",
+                            "severity": "Medium",
+                        }
+                    ],
+                    "artifact": {"name": "requests", "version": "2.27.0"},
+                }
+            ]
+        }
+        f = tmp_path / "grype_real.json"
+        f.write_text(json.dumps(grype_data))
+
+        result = _parse_scanner_input(str(f))
+        assert result == ["CVE-2023-32681"]
+

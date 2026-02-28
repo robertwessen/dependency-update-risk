@@ -157,6 +157,61 @@ def _check_exit_risk(actual_risk: str, threshold: str) -> bool:
     return _RISK_ORDER.get(actual_risk.lower(), -1) >= _RISK_ORDER.get(threshold.lower(), 999)
 
 
+def _parse_scanner_input(path: str) -> list[str]:
+    """Extract CVE IDs from Trivy, Grype, or OSV-Scanner JSON output."""
+    with open(path) as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        return []
+
+    cve_ids: list[str] = []
+
+    # Trivy: {"Results": [{"Vulnerabilities": [{"VulnerabilityID": "CVE-..."}]}]}
+    if "Results" in data:
+        for result in data.get("Results") or []:
+            for vuln in result.get("Vulnerabilities") or []:
+                vid = vuln.get("VulnerabilityID", "")
+                if vid.upper().startswith("CVE-"):
+                    cve_ids.append(vid)
+
+    # Grype: primary id is often a GHSA id; CVE appears in relatedVulnerabilities
+    # {"matches": [{"vulnerability": {"id": "GHSA-..."}, "relatedVulnerabilities": [{"id": "CVE-..."}]}]}
+    elif "matches" in data:
+        for match in data.get("matches") or []:
+            vid = match.get("vulnerability", {}).get("id", "")
+            if vid.upper().startswith("CVE-"):
+                cve_ids.append(vid)
+            else:
+                for related in match.get("relatedVulnerabilities") or []:
+                    rid = related.get("id", "")
+                    if rid.upper().startswith("CVE-"):
+                        cve_ids.append(rid)
+
+    # OSV-Scanner: {"results": [{"packages": [{"vulnerabilities": [{"id": "GHSA-...", "aliases": ["CVE-..."]}]}]}]}
+    # The top-level id is an OSV/GHSA id; the CVE appears in the aliases list.
+    elif "results" in data:
+        for result in data.get("results") or []:
+            for pkg in result.get("packages") or []:
+                for vuln in pkg.get("vulnerabilities") or []:
+                    vid = vuln.get("id", "")
+                    if vid.upper().startswith("CVE-"):
+                        cve_ids.append(vid)
+                    else:
+                        for alias in vuln.get("aliases") or []:
+                            if alias.upper().startswith("CVE-"):
+                                cve_ids.append(alias)
+
+    # Deduplicate preserving order
+    seen: set[str] = set()
+    unique = []
+    for vid in cve_ids:
+        if vid not in seen:
+            seen.add(vid)
+            unique.append(vid)
+    return unique
+
+
 def _estimate_previous_version(fixed_version: str) -> tuple[Optional[str], bool]:
     """Returns (estimated_version, is_ambiguous). None means no reliable estimate."""
     from packaging.version import InvalidVersion, Version
@@ -182,7 +237,7 @@ def main() -> None:
 
 
 @main.command()
-@click.argument("cve_id")
+@click.argument("cve_id", required=False, default=None)
 @click.option(
     "--version",
     "-v",
@@ -266,6 +321,12 @@ def main() -> None:
     default=None,
     help="Exit with code 1 if risk level meets or exceeds this threshold (for CI use)",
 )
+@click.option(
+    "--input",
+    "input_file",
+    type=click.Path(exists=True),
+    help="Scanner JSON file (Trivy, Grype, or OSV-Scanner output) — analyze all CVEs found",
+)
 def analyze(
     cve_id: str,
     current_version: Optional[str],
@@ -283,6 +344,7 @@ def analyze(
     json_only: bool,
     nvd_api_key: Optional[str],
     min_exit_risk: Optional[str],
+    input_file: Optional[str] = None,
 ) -> None:
     """Analyze breaking change risk for a CVE security update.
 
@@ -291,6 +353,25 @@ def analyze(
     # Back-compat: --json-only maps to --format json
     if json_only:
         output_format = "json"
+
+    # Validate: CVE_ID xor --input required
+    if input_file and cve_id:
+        raise click.UsageError("Cannot use both CVE_ID argument and --input at the same time.")
+    if not input_file and not cve_id:
+        raise click.UsageError("Provide a CVE_ID argument or use --input FILE.")
+
+    # Build list of CVEs to process
+    if input_file:
+        cve_ids_to_process = _parse_scanner_input(input_file)
+        if not cve_ids_to_process:
+            console.print("[bold yellow]Warning:[/bold yellow] No CVE IDs found in scanner input file.")
+            return
+        if output_format == "rich" and len(cve_ids_to_process) > 1:
+            console.print(
+                f"[bold blue]Found {len(cve_ids_to_process)} CVEs in scanner output.[/bold blue]"
+            )
+    else:
+        cve_ids_to_process = [cve_id]
 
     # Enable verbose logging if debug is set
     setup_logging(verbose or debug)
@@ -472,18 +553,26 @@ def analyze(
 
         return result
 
-    result = asyncio.run(run_analysis())
+    original_current_version = current_version
+    all_results = []
+    for _cve in cve_ids_to_process:
+        cve_id = _cve  # rebind in outer scope; captured by run_analysis() closure
+        current_version = original_current_version  # reset per-CVE
+        r = asyncio.run(run_analysis())
+        if r:
+            all_results.append(r)
 
-    # CI exit code: exit 1 if risk meets or exceeds threshold
-    if min_exit_risk and result:
-        actual_risk = result.get("risk_level", "")
-        if _check_exit_risk(actual_risk, min_exit_risk):
-            if output_format == "rich":
-                console.print(
-                    f"[bold red]Exiting with code 1:[/bold red] risk level "
-                    f"[bold]{actual_risk}[/bold] meets --min-exit-risk threshold ({min_exit_risk})"
-                )
-            sys.exit(1)
+    # CI exit code: exit 1 if ANY CVE meets or exceeds threshold
+    if min_exit_risk:
+        for r in all_results:
+            actual_risk = r.get("risk_level", "")
+            if _check_exit_risk(actual_risk, min_exit_risk):
+                if output_format == "rich":
+                    console.print(
+                        f"[bold red]Exiting with code 1:[/bold red] risk level "
+                        f"[bold]{actual_risk}[/bold] meets --min-exit-risk threshold ({min_exit_risk})"
+                    )
+                sys.exit(1)
 
 
 def _print_rich_results(result: dict) -> None:
