@@ -9,6 +9,7 @@ from dep_risk.models import AffectedPackage, Ecosystem
 from dep_risk.release_notes import (
     ReleaseNotesFetcher,
     _extract_github_info,
+    _extract_github_url_from_pom,
     _parse_version,
     _version_in_range,
 )
@@ -206,6 +207,55 @@ class TestCargoReleases:
         assert notes == []
 
 
+class TestExtractGitHubUrlFromPom:
+    """Unit tests for the POM XML SCM URL extractor."""
+
+    def test_extracts_url_element(self):
+        pom = """<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <scm>
+    <url>https://github.com/apache/logging-log4j2</url>
+  </scm>
+</project>"""
+        assert _extract_github_url_from_pom(pom) == "https://github.com/apache/logging-log4j2"
+
+    def test_strips_scm_git_prefix_from_connection(self):
+        pom = """<project>
+  <scm>
+    <connection>scm:git:https://github.com/owner/repo.git</connection>
+  </scm>
+</project>"""
+        result = _extract_github_url_from_pom(pom)
+        assert result is not None
+        assert "github.com/owner/repo" in result
+
+    def test_returns_none_when_no_scm_block(self):
+        pom = """<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <groupId>org.example</groupId>
+</project>"""
+        assert _extract_github_url_from_pom(pom) is None
+
+    def test_returns_none_when_scm_has_no_github(self):
+        pom = """<project>
+  <scm>
+    <url>https://svn.apache.org/repos/asf/myproject</url>
+  </scm>
+</project>"""
+        assert _extract_github_url_from_pom(pom) is None
+
+    def test_returns_none_on_invalid_xml(self):
+        assert _extract_github_url_from_pom("not xml at all") is None
+
+    def test_handles_no_namespace(self):
+        """Non-namespaced POM (older Maven projects) still parsed correctly."""
+        pom = """<project>
+  <scm>
+    <url>https://github.com/oldorg/oldrepo</url>
+  </scm>
+</project>"""
+        assert _extract_github_url_from_pom(pom) == "https://github.com/oldorg/oldrepo"
+
+
 class TestMavenReleases:
     """Tests for Maven release note fetching."""
 
@@ -229,6 +279,57 @@ class TestMavenReleases:
 
         notes = await fetcher._fetch_maven_releases("org.example:mylib")
         assert notes == []
+
+    @pytest.mark.asyncio
+    async def test_fetches_github_url_from_pom_scm(self):
+        """Slow-path: Solr search returns latestVersion → POM fetched → SCM URL parsed → GitHub releases returned."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from dep_risk.config import Config
+        from dep_risk.models import ReleaseNote
+        from dep_risk.release_notes import ReleaseNotesFetcher
+
+        config = Config()
+        fetcher = ReleaseNotesFetcher(config)
+
+        solr_response = MagicMock()
+        solr_response.status_code = 200
+        solr_response.json.return_value = {
+            "response": {
+                "docs": [
+                    {
+                        "g": "org.apache.logging.log4j",
+                        "a": "log4j-core",
+                        "latestVersion": "2.20.0",
+                    }
+                ]
+            }
+        }
+
+        pom_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <scm>
+    <url>https://github.com/apache/logging-log4j2</url>
+    <connection>scm:git:https://github.com/apache/logging-log4j2.git</connection>
+  </scm>
+</project>"""
+        pom_response = MagicMock()
+        pom_response.status_code = 200
+        pom_response.text = pom_xml
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=[solr_response, pom_response])
+        fetcher._client = mock_client
+
+        github_note = ReleaseNote(
+            version="2.15.0", content="Log4j release", source="GitHub Releases"
+        )
+        with patch.object(fetcher, "_fetch_github_releases", return_value=[github_note]):
+            notes = await fetcher._fetch_maven_releases(
+                "org.apache.logging.log4j:log4j-core", "2.14.1", "2.15.0"
+            )
+
+        assert len(notes) == 1
+        assert notes[0].source == "GitHub Releases"
 
     @pytest.mark.asyncio
     async def test_uses_github_when_groupid_matches(self):

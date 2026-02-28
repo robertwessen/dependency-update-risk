@@ -63,6 +63,37 @@ def _version_in_range(
         return True  # Include if we can't parse
 
 
+def _extract_github_url_from_pom(xml_text: str) -> Optional[str]:
+    """Parse a Maven POM XML string and return a GitHub URL from the <scm> block.
+
+    Handles both namespaced and non-namespaced POM files.  Checks <url>,
+    <connection>, and <developerConnection> elements, stripping any
+    ``scm:git:`` prefix that Maven SCM coordinates use.
+    """
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+
+    # POM files may carry the Maven namespace or omit it entirely.
+    for ns_prefix in ["{http://maven.apache.org/POM/4.0.0}", ""]:
+        scm = root.find(f"{ns_prefix}scm")
+        if scm is None:
+            continue
+        for tag in ["url", "connection", "developerConnection"]:
+            elem = scm.find(f"{ns_prefix}{tag}")
+            if elem is not None and elem.text:
+                url = elem.text.strip()
+                # Strip Maven SCM coordinate prefix: "scm:git:https://..." → "https://..."
+                if url.startswith("scm:"):
+                    url = re.sub(r"^scm:[a-z+]+:", "", url)
+                if "github.com" in url:
+                    return url
+    return None
+
+
 def _extract_github_info(url: str) -> Optional[tuple[str, str]]:
     """Extract owner and repo from GitHub URL."""
     patterns = [
@@ -537,60 +568,68 @@ class ReleaseNotesFetcher:
         start_version: Optional[str] = None,
         end_version: Optional[str] = None,
     ) -> list[ReleaseNote]:
-        """Fetch release notes for Maven packages via GitHub fallback."""
-        # Parse groupId:artifactId format
+        """Fetch release notes for Maven packages.
+
+        Strategy (in order):
+        1. Fast-path: ``io.github.{owner}`` GroupId pattern → derive GitHub URL directly,
+           no network call needed.
+        2. Slow-path: query Maven Central Solr for ``latestVersion``, then fetch the POM
+           file from ``repo1.maven.org`` and parse its ``<scm>`` block for a GitHub URL.
+           Resolved URL is cached so subsequent runs skip the Solr+POM round-trip.
+        3. Once a GitHub URL is known, try GitHub Releases then fall back to CHANGELOG.
+        """
         if ":" in package_name:
             group_id, artifact_id = package_name.split(":", 1)
         else:
             group_id, artifact_id = None, package_name
 
-        # Query Maven Central search for SCM/repository URL
-        cache_key = f"maven_{package_name}"
-        if self.cache and self.config.use_cache:
-            cached = self.cache.get("releases", cache_key)
-            if cached:
-                logger.debug(f"Using cached Maven search data for {package_name}")
-                search_data = cached
+        repo_url: Optional[str] = None
+
+        # ── Fast-path: io.github.{owner} GroupId pattern ──────────────────────
+        if group_id:
+            parts = group_id.split(".")
+            if len(parts) >= 3 and parts[1] == "github":
+                repo_url = f"https://github.com/{parts[2]}/{artifact_id}"
+
+        # ── Slow-path: Solr search → POM XML → SCM URL ────────────────────────
+        if not repo_url and group_id:
+            cache_key = f"maven_scm_{package_name}"
+            cached_url: Optional[str] = None
+            if self.cache and self.config.use_cache:
+                cached_url = self.cache.get("releases", cache_key)
+            if cached_url:
+                repo_url = cached_url
             else:
-                search_data = None
-        else:
-            search_data = None
+                logger.debug(f"Searching Maven Central for SCM URL: {package_name}")
+                try:
+                    query = f"a:{artifact_id} AND g:{group_id}"
+                    resp = await self._client.get(
+                        "https://search.maven.org/solrsearch/select",
+                        params={"q": query, "rows": 1, "wt": "json"},
+                    )
+                    resp.raise_for_status()
+                    docs = resp.json().get("response", {}).get("docs", [])
+                    if docs:
+                        latest_version = docs[0].get("latestVersion") or docs[0].get("v")
+                        if latest_version:
+                            # Fetch POM for the resolved latest version
+                            group_path = group_id.replace(".", "/")
+                            pom_url = (
+                                f"https://repo1.maven.org/maven2/{group_path}/"
+                                f"{artifact_id}/{latest_version}/"
+                                f"{artifact_id}-{latest_version}.pom"
+                            )
+                            pom_resp = await self._client.get(pom_url)
+                            if pom_resp.status_code == 200:
+                                repo_url = _extract_github_url_from_pom(pom_resp.text)
+                                if repo_url and self.cache:
+                                    self.cache.set("releases", cache_key, repo_url)
+                except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                    logger.debug(
+                        f"Maven Central search/POM fetch failed for {package_name}: {e}"
+                    )
 
-        if search_data is None:
-            logger.debug(f"Searching Maven Central for {package_name}")
-            try:
-                query = f"a:{artifact_id}"
-                if group_id:
-                    query += f" AND g:{group_id}"
-                response = await self._client.get(
-                    "https://search.maven.org/solrsearch/select",
-                    params={"q": query, "rows": 1, "wt": "json"},
-                )
-                response.raise_for_status()
-                search_data = response.json()
-
-                if self.cache:
-                    self.cache.set("releases", cache_key, search_data)
-            except httpx.HTTPStatusError as e:
-                logger.warning(f"Maven Central search error for {package_name}: {e.response.status_code}")
-                return []
-            except httpx.RequestError as e:
-                logger.warning(f"Maven Central search failed for {package_name}: {e}")
-                return []
-
-        # Extract repository URL from search result
-        docs = search_data.get("response", {}).get("docs", [])
-        repo_url = None
-        if docs:
-            # Maven Central search doesn't return SCM URLs directly; check common patterns
-            g = docs[0].get("g", group_id or "")
-            a = docs[0].get("a", artifact_id)
-            if g:
-                # Convert reverse-domain groupId like io.github.myorg → github.com/myorg/artifact
-                parts = g.split(".")
-                if len(parts) >= 3 and parts[1] == "github":
-                    repo_url = f"https://github.com/{parts[2]}/{a}"
-
+        # ── Fetch release notes from resolved GitHub URL ───────────────────────
         if repo_url:
             github_info = _extract_github_info(repo_url)
             if github_info:
@@ -692,6 +731,25 @@ class ReleaseNotesFetcher:
         if end_version is None and package.fixed_versions:
             end_version = package.fixed_versions[0]
 
+        # Warn early when the version range is provably empty so callers can
+        # surface a useful message rather than silently returning [].
+        if start_version and end_version and start_version != "unknown":
+            try:
+                from packaging.version import InvalidVersion, Version
+
+                sv = Version(start_version.lstrip("vV"))
+                ev = Version(end_version.lstrip("vV"))
+                if sv >= ev:
+                    logger.warning(
+                        f"Empty version range for {package.name}: "
+                        f"current ({start_version}) >= fixed ({end_version}). "
+                        f"No release notes will be returned. "
+                        f"Provide the correct --version to resolve this."
+                    )
+                    return []
+            except (InvalidVersion, Exception):
+                pass  # non-PEP-440 versions: proceed and let _version_in_range handle it
+
         # Try repository URL first for GitHub
         if package.repository_url:
             github_info = _extract_github_info(package.repository_url)
@@ -726,6 +784,11 @@ class ReleaseNotesFetcher:
             elif package.ecosystem == Ecosystem.GO:
                 notes = await self._fetch_go_releases(
                     package.name, start_version, end_version
+                )
+            else:
+                logger.debug(
+                    f"Unknown ecosystem '{package.ecosystem.value}' for {package.name} — "
+                    f"no ecosystem registry fetcher available."
                 )
 
         # Sort by version (newest first)

@@ -1,0 +1,83 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-22.04
+            artifact: dep-risk-linux-x86_64
+          - os: linux
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            artifact: dep-risk-linux-arm64
+          - os: macos
+            arch: arm64
+            runner: macos-14
+            artifact: dep-risk-macos-arm64
+          - os: windows
+            arch: x64
+            runner: windows-2022
+            artifact: dep-risk-windows-x64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dep-risk and PyInstaller
+        run: |
+          pip install -e ".[dev]"
+
+      - name: Build binary (Unix)
+        if: matrix.os != 'windows'
+        run: |
+          pyinstaller src/dep_risk/cli.py \
+            --onefile \
+            --name dep-risk \
+            --clean
+          mv dist/dep-risk dist/${{ matrix.artifact }}
+
+      - name: Build binary (Windows)
+        if: matrix.os == 'windows'
+        run: |
+          pyinstaller src\dep_risk\cli.py `
+            --onefile `
+            --name dep-risk `
+            --clean
+          Rename-Item dist\dep-risk.exe dist\${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  release:
+    name: Attach binaries to GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

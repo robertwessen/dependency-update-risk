@@ -116,6 +116,26 @@ class RiskAnalysis(BaseModel):
         default=0, description="Number of release notes analyzed"
     )
     analysis_summary: str = Field(default="", description="Human-readable summary")
+    fix_available: bool = Field(
+        default=True,
+        description="Whether a fixed version is known for this CVE+package combination",
+    )
+    version_estimated: bool = Field(
+        default=False,
+        description="True when current_version was estimated (decremented from fixed version) rather than user-supplied via --version",
+    )
+    version_estimate_basis: Optional[str] = Field(
+        default=None,
+        description="Describes what the version estimate was derived from (e.g. 'decremented from fixed version 5.4')",
+    )
+    ecosystem_supported: bool = Field(
+        default=True,
+        description="Whether dep-risk has a release notes fetcher for this package's ecosystem",
+    )
+    release_notes_available: bool = Field(
+        default=True,
+        description="Whether release notes were successfully retrieved; False means either the ecosystem is unsupported or the maintainer does not publish release notes",
+    )
 
 
 def _utc_now() -> datetime:

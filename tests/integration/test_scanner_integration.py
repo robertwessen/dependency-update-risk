@@ -117,14 +117,21 @@ def test_trivy_extracts_cve_ids(version: str, vuln_dir: Path, tmp_path: Path) ->
     out_file = tmp_path / f"trivy_{version}.json"
     out_file.write_text(raw)
 
-    cve_ids = _parse_scanner_input(str(out_file))
+    findings = _parse_scanner_input(str(out_file))
 
-    assert len(cve_ids) >= 1, (
-        f"Trivy {version}: expected ≥1 CVE, got 0.\n"
+    assert len(findings) >= 1, (
+        f"Trivy {version}: expected ≥1 CVE finding, got 0.\n"
         f"Raw output (first 800 chars):\n{raw[:800]}"
     )
-    assert all(v.upper().startswith("CVE-") for v in cve_ids), (
-        f"Non-CVE IDs slipped through: {cve_ids}"
+    assert all(f.cve_id.upper().startswith("CVE-") for f in findings), (
+        f"Non-CVE IDs slipped through: {[f.cve_id for f in findings]}"
+    )
+    # Trivy should carry package name and installed version
+    assert all(f.package_name for f in findings), (
+        f"Trivy {version}: expected package_name to be populated in every finding"
+    )
+    assert all(f.package_version for f in findings), (
+        f"Trivy {version}: expected package_version (InstalledVersion) to be populated"
     )
 
 
@@ -148,14 +155,21 @@ def test_grype_extracts_cve_ids(version: str, vuln_dir: Path, tmp_path: Path) ->
     out_file = tmp_path / f"grype_{version}.json"
     out_file.write_text(raw)
 
-    cve_ids = _parse_scanner_input(str(out_file))
+    findings = _parse_scanner_input(str(out_file))
 
-    assert len(cve_ids) >= 1, (
-        f"Grype {version}: expected ≥1 CVE, got 0.\n"
+    assert len(findings) >= 1, (
+        f"Grype {version}: expected ≥1 CVE finding, got 0.\n"
         f"Raw output (first 800 chars):\n{raw[:800]}"
     )
-    assert all(v.upper().startswith("CVE-") for v in cve_ids), (
-        f"Non-CVE IDs slipped through: {cve_ids}"
+    assert all(f.cve_id.upper().startswith("CVE-") for f in findings), (
+        f"Non-CVE IDs slipped through: {[f.cve_id for f in findings]}"
+    )
+    # Grype artifact block should carry package name and version
+    assert all(f.package_name for f in findings), (
+        f"Grype {version}: expected package_name to be populated from artifact"
+    )
+    assert all(f.package_version for f in findings), (
+        f"Grype {version}: expected package_version to be populated from artifact"
     )
 
 
@@ -182,15 +196,22 @@ def test_osv_scanner_extracts_cve_ids(version: str, vuln_dir: Path, tmp_path: Pa
     out_file = tmp_path / f"osv_scanner_{version}.json"
     out_file.write_text(raw)
 
-    cve_ids = _parse_scanner_input(str(out_file))
+    findings = _parse_scanner_input(str(out_file))
 
-    assert len(cve_ids) >= 1, (
-        f"OSV-Scanner {version}: expected ≥1 CVE, got 0.\n"
+    assert len(findings) >= 1, (
+        f"OSV-Scanner {version}: expected ≥1 CVE finding, got 0.\n"
         f"Reminder: OSV uses GHSA IDs with CVEs in aliases — check aliases support.\n"
         f"Raw output (first 800 chars):\n{raw[:800]}"
     )
-    assert all(v.upper().startswith("CVE-") for v in cve_ids), (
-        f"Non-CVE IDs slipped through: {cve_ids}"
+    assert all(f.cve_id.upper().startswith("CVE-") for f in findings), (
+        f"Non-CVE IDs slipped through: {[f.cve_id for f in findings]}"
+    )
+    # OSV-Scanner carries package name, version, and ecosystem
+    assert all(f.package_name for f in findings), (
+        f"OSV-Scanner {version}: expected package_name from package block"
+    )
+    assert all(f.package_version for f in findings), (
+        f"OSV-Scanner {version}: expected package_version from package block"
     )
 
 
