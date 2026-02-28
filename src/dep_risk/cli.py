@@ -22,6 +22,9 @@ from .models import Ecosystem, RiskLevel
 from .release_notes import ReleaseNotesFetcher
 
 console = Console()
+# Separate stderr console for logging — prevents log lines from polluting stdout
+# when users redirect output to a file (e.g. dep-risk analyze --format json > out.json).
+_log_console = Console(stderr=True)
 
 
 def setup_logging(verbose: bool) -> None:
@@ -30,7 +33,7 @@ def setup_logging(verbose: bool) -> None:
     logging.basicConfig(
         level=level,
         format="%(message)s",
-        handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)],
+        handlers=[RichHandler(console=_log_console, rich_tracebacks=True, show_path=False)],
     )
 
 
@@ -419,6 +422,11 @@ async def _query_osv_batch(
 ) -> list[ScannerFinding]:
     """Query OSV /v1/querybatch to find CVEs for a list of (ecosystem, name, version) tuples.
 
+    OSV querybatch returns minimal vuln stubs {id, modified} — aliases (including CVE IDs)
+    are NOT present in the batch response.  For any vuln whose id does not start with
+    "CVE-", we fetch the full record from /v1/vulns/{id} to extract the CVE alias.
+    These secondary fetches are parallelised with asyncio.gather().
+
     Results are deduplicated on (cve_id, package_name).  HTTP errors are logged
     as warnings and return an empty list — they do not propagate as exceptions.
 
@@ -429,11 +437,14 @@ async def _query_osv_batch(
 
     _logger = logging.getLogger(__name__)
     _OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
+    _OSV_VULN_URL = "https://api.osv.dev/v1/vulns/{}"
     _CHUNK_SIZE = 500
 
-    all_findings: list[ScannerFinding] = []
+    # Intermediate: list of (ecosystem, name, version, vuln_id) pending CVE resolution
+    pending: list[tuple[str, str, str, str]] = []
 
     async with httpx.AsyncClient(timeout=30.0) as client:
+        # ── Phase 1: querybatch to collect vuln stubs ──────────────────────
         for chunk_start in range(0, len(packages), _CHUNK_SIZE):
             chunk = packages[chunk_start : chunk_start + _CHUNK_SIZE]
             queries = [
@@ -455,25 +466,54 @@ async def _query_osv_batch(
             results = resp.json().get("results") or []
             for (ecosystem, name, version), result in zip(chunk, results):
                 for vuln in result.get("vulns") or []:
-                    # Extract CVE ID from primary id or aliases list
-                    cve_id: Optional[str] = None
                     vid = vuln.get("id", "")
-                    if vid.upper().startswith("CVE-"):
-                        cve_id = vid
-                    else:
-                        for alias in vuln.get("aliases") or []:
-                            if alias.upper().startswith("CVE-"):
-                                cve_id = alias
-                                break
-                    if cve_id:
-                        all_findings.append(
-                            ScannerFinding(
-                                cve_id=cve_id,
-                                package_name=name,
-                                package_version=version,
-                                ecosystem=ecosystem,
-                            )
-                        )
+                    if vid:
+                        pending.append((ecosystem, name, version, vid))
+
+        if not pending:
+            return []
+
+        # ── Phase 2: resolve non-CVE IDs to their CVE aliases ─────────────
+        # Collect unique non-CVE vuln IDs that need a full-record fetch
+        non_cve_ids: set[str] = {
+            vid for _, _, _, vid in pending if not vid.upper().startswith("CVE-")
+        }
+
+        # Fetch all non-CVE records in parallel
+        async def _fetch_vuln(vid: str) -> tuple[str, Optional[str]]:
+            """Return (vuln_id, cve_alias_or_None)."""
+            try:
+                r = await client.get(_OSV_VULN_URL.format(vid))
+                r.raise_for_status()
+                data = r.json()
+                for alias in data.get("aliases") or []:
+                    if alias.upper().startswith("CVE-"):
+                        return vid, alias
+                return vid, None
+            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                _logger.warning(f"OSV vuln fetch failed for {vid}: {e}")
+                return vid, None
+
+        fetch_results = await asyncio.gather(*(_fetch_vuln(vid) for vid in non_cve_ids))
+        osv_to_cve: dict[str, Optional[str]] = dict(fetch_results)
+
+        # ── Phase 3: assemble ScannerFindings with resolved CVE IDs ────────
+        all_findings: list[ScannerFinding] = []
+        for ecosystem, name, version, vid in pending:
+            if vid.upper().startswith("CVE-"):
+                cve_id: Optional[str] = vid
+            else:
+                cve_id = osv_to_cve.get(vid)
+
+            if cve_id:
+                all_findings.append(
+                    ScannerFinding(
+                        cve_id=cve_id,
+                        package_name=name,
+                        package_version=version,
+                        ecosystem=ecosystem,
+                    )
+                )
 
     # Deduplicate on (cve_id, package_name) — preserve first-seen order
     seen: set[tuple] = set()
@@ -981,7 +1021,7 @@ def analyze(
                         "release_notes_available": release_notes_available,
                         "severity": cve_info.severity.value,
                         "cvss_score": cve_info.cvss_score,
-                        "release_notes_found": len(release_notes),
+                        "release_notes_analyzed": len(release_notes),
                         "note": (
                             "LLM analysis disabled (--no-llm)"
                             if no_llm
@@ -1010,6 +1050,9 @@ def analyze(
                     result = analysis.model_dump()
                     result["ecosystem"] = analysis.ecosystem.value
                     result["risk_level"] = analysis.risk_level.value
+                    # Overlay CVEInfo fields for output consistency with --no-llm mode
+                    result["severity"] = cve_info.severity.value
+                    result["cvss_score"] = cve_info.cvss_score
                     # #13 — overlay estimated-version metadata onto the serialized result
                     result["version_estimated"] = version_was_estimated
                     result["version_estimate_basis"] = estimate_basis
@@ -1036,7 +1079,11 @@ def analyze(
                     if output_format == "rich" and not pkg_results:
                         console.print(f"\n[green]Results written to {output}[/green]")
                 elif output_format == "json":
-                    print(json_output)
+                    if len(items_to_process) <= 1:
+                        # Single-CVE mode: emit one JSON object immediately (backward-compatible).
+                        print(json_output)
+                    # Multi-CVE (SBOM/scanner) mode: defer — outer loop emits the full array.
+                    # Do NOT fall through to the rich output branch in either case.
                 elif output_format in ("markdown", "sarif"):
                     print(output_str)
                 else:
@@ -1057,6 +1104,11 @@ def analyze(
         current_version = original_current_version  # reset per-CVE
         pkg_results = asyncio.run(run_analysis())
         all_results.extend(pkg_results)
+
+    # Multi-CVE (SBOM / scanner) mode: emit a single JSON array for all results.
+    # Single-CVE mode already printed its one object inside run_analysis().
+    if output_format == "json" and len(items_to_process) > 1:
+        print(json.dumps(all_results, indent=2, default=str))
 
     # CI exit code: exit 1 if ANY CVE meets or exceeds threshold
     if min_exit_risk:

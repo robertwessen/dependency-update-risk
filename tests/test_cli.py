@@ -991,24 +991,37 @@ class TestQueryOsvBatch:
         assert findings[0].ecosystem == "PyPI"
 
     async def test_extracts_cve_from_aliases_when_primary_is_ghsa(self, httpx_mock):
-        """Real OSV output uses GHSA as primary id; CVE is in aliases."""
+        """Real OSV querybatch returns minimal stubs (id+modified only, no aliases).
+        For non-CVE ids, a second fetch to /v1/vulns/{id} retrieves the full record."""
+        # Phase 1: querybatch returns GHSA id (no aliases — matches real API behaviour)
         httpx_mock.add_response(
             url="https://api.osv.dev/v1/querybatch",
             json=self._osv_response([
-                {"vulns": [self._vuln("GHSA-j8r2-6x86-q33q", ["CVE-2023-32681"])]}
+                {"vulns": [{"id": "GHSA-j8r2-6x86-q33q", "modified": "2024-01-01T00:00:00Z"}]}
             ]),
+        )
+        # Phase 2: individual vuln fetch returns full record with CVE alias
+        httpx_mock.add_response(
+            url="https://api.osv.dev/v1/vulns/GHSA-j8r2-6x86-q33q",
+            json={"id": "GHSA-j8r2-6x86-q33q", "aliases": ["CVE-2023-32681", "PYSEC-2023-74"]},
         )
         findings = await _query_osv_batch([("PyPI", "requests", "2.27.0")])
         assert len(findings) == 1
         assert findings[0].cve_id == "CVE-2023-32681"
 
     async def test_skips_vuln_without_cve_id_or_alias(self, httpx_mock):
-        """GHSA-only vulnerabilities with no CVE alias are excluded."""
+        """GHSA-only vulnerabilities with no CVE alias in full record are excluded."""
+        # Phase 1: querybatch returns non-CVE id
         httpx_mock.add_response(
             url="https://api.osv.dev/v1/querybatch",
             json=self._osv_response([
-                {"vulns": [self._vuln("GHSA-xxxx-yyyy-zzzz")]}
+                {"vulns": [{"id": "GHSA-xxxx-yyyy-zzzz", "modified": "2024-01-01T00:00:00Z"}]}
             ]),
+        )
+        # Phase 2: full record has no CVE aliases
+        httpx_mock.add_response(
+            url="https://api.osv.dev/v1/vulns/GHSA-xxxx-yyyy-zzzz",
+            json={"id": "GHSA-xxxx-yyyy-zzzz", "aliases": ["PYSEC-9999-99"]},
         )
         findings = await _query_osv_batch([("PyPI", "requests", "2.27.0")])
         assert findings == []
@@ -1063,15 +1076,21 @@ class TestQueryOsvBatch:
         assert cve_ids == {"CVE-2021-44228", "CVE-2021-45046"}
 
     async def test_deduplicates_same_cve_same_package(self, httpx_mock):
-        """If OSV returns the same CVE twice for a package (via id AND alias), deduplicate."""
+        """If OSV returns the same CVE via both direct id and a GHSA alias, deduplicate."""
+        # Phase 1: querybatch returns one direct CVE id and one GHSA id for the same CVE
         httpx_mock.add_response(
             url="https://api.osv.dev/v1/querybatch",
             json=self._osv_response([{
                 "vulns": [
-                    self._vuln("CVE-2023-32681"),
-                    self._vuln("GHSA-j8r2-6x86-q33q", ["CVE-2023-32681"]),  # same CVE via alias
+                    {"id": "CVE-2023-32681", "modified": "2024-01-01T00:00:00Z"},
+                    {"id": "GHSA-j8r2-6x86-q33q", "modified": "2024-01-01T00:00:00Z"},
                 ]
             }]),
+        )
+        # Phase 2: full vuln fetch for GHSA resolves to same CVE
+        httpx_mock.add_response(
+            url="https://api.osv.dev/v1/vulns/GHSA-j8r2-6x86-q33q",
+            json={"id": "GHSA-j8r2-6x86-q33q", "aliases": ["CVE-2023-32681"]},
         )
         findings = await _query_osv_batch([("PyPI", "requests", "2.27.0")])
         assert len(findings) == 1
