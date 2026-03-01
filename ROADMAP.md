@@ -38,11 +38,11 @@ Ordered by impact-to-effort ratio. Items at the top deliver the most value for t
 - Read requirements.txt / package.json / Cargo.lock and extract all dependencies
 - Batch-query OSV `/v1/querybatch` endpoint for CVEs across all deps
 - Output a rich risk table sorted by severity
-- Prerequisite: Item #5 (refactor `analyze()`) should be done first
+- Prerequisite: ~~Item #5 (refactor `analyze()`) should be done first~~ — **Done (#5 complete)**
 
 ---
 
-## #5 — Refactor `analyze()` in cli.py
+## ~~#5 — Refactor `analyze()` in cli.py~~ ✅ Done
 **Impact:** Medium | **Effort:** Medium
 
 - Extract `async def run_cve_analysis()` into a new `analysis.py` module
@@ -111,7 +111,7 @@ Ordered by impact-to-effort ratio. Items at the top deliver the most value for t
 - Report: "2 of 3 breaking changes affect your code at src/api.py:42, src/client.py:17"
 - Collapses high risk → low risk when your code doesn't actually use the changed API
 - Use `ast.parse` for Python, `@babel/parser` for JS — ecosystem-appropriate static analysis
-- Prerequisite: Item #5 (analysis module refactor) required for clean integration
+- Prerequisite: ~~Item #5 (analysis module refactor) required for clean integration~~ — **Done (#5 complete)**
 
 ---
 

@@ -12,12 +12,18 @@ import httpx
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
-from rich.table import Table
 
 from . import __version__
+from .analysis import (
+    _SUPPORTED_ECOSYSTEMS,
+    _estimate_previous_version,
+    _format_markdown,
+    _format_sarif,
+    _fuzzy_match_package,
+    run_cve_analysis,
+)
 from .config import Cache, Config
 from .cve_resolver import CVEResolver
-from .llm_analyzer import LLMAnalyzer
 from .models import Ecosystem, RiskLevel
 from .release_notes import ReleaseNotesFetcher
 
@@ -37,127 +43,7 @@ def setup_logging(verbose: bool) -> None:
     )
 
 
-_SARIF_LEVEL = {"low": "note", "medium": "warning", "high": "error", "critical": "error"}
 _RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
-_SUPPORTED_ECOSYSTEMS: frozenset = frozenset(
-    {Ecosystem.PYPI, Ecosystem.NPM, Ecosystem.MAVEN, Ecosystem.CARGO, Ecosystem.GO}
-)
-
-
-def _format_markdown(result: dict) -> str:
-    """Format analysis result as Markdown."""
-    lines = [
-        f"# dep-risk Analysis: {result.get('cve_id', 'N/A')}",
-        "",
-        "| Field | Value |",
-        "|-------|-------|",
-        f"| Package | {result.get('package_name', 'N/A')} ({result.get('ecosystem', 'N/A')}) |",
-        f"| Version | {result.get('current_version', '?')} → {result.get('target_version', '?')} |",
-        f"| Risk Level | {result.get('risk_level', 'unknown').upper()} |",
-    ]
-    if "confidence" in result:
-        lines.append(f"| Confidence | {result['confidence']:.0%} |")
-    lines.append(f"| Release Notes | {result.get('release_notes_analyzed', 0)} analyzed |")
-
-    summary = result.get("analysis_summary", "")
-    if summary:
-        lines += ["", "## Summary", "", summary]
-
-    breaking_changes = result.get("breaking_changes", [])
-    if breaking_changes:
-        lines += [
-            "",
-            "## Breaking Changes",
-            "",
-            "| Description | Affected API | Migration Hint |",
-            "|-------------|-------------|----------------|",
-        ]
-        for bc in breaking_changes:
-            if isinstance(bc, dict):
-                desc = bc.get("description", "")
-                api = bc.get("affected_api", "-") or "-"
-                hint = bc.get("migration_hint", "-") or "-"
-                lines.append(f"| {desc} | {api} | {hint} |")
-
-    migration_notes = result.get("migration_notes", [])
-    if migration_notes:
-        lines += ["", "## Migration Notes", ""]
-        lines += [f"- {note}" for note in migration_notes]
-
-    deprecations = result.get("deprecations", [])
-    if deprecations:
-        lines += ["", "## Deprecations", ""]
-        lines += [f"- {dep}" for dep in deprecations]
-
-    return "\n".join(lines) + "\n"
-
-
-def _format_sarif(result: dict) -> str:
-    """Format analysis result as SARIF 2.1.0."""
-    cve_id = result.get("cve_id", "UNKNOWN")
-    risk_level = result.get("risk_level", "low")
-    package_name = result.get("package_name", "unknown")
-    ecosystem = result.get("ecosystem", "unknown")
-    current_version = result.get("current_version", "unknown")
-    target_version = result.get("target_version", "unknown")
-    summary = result.get("analysis_summary") or (
-        f"Risk level: {risk_level}. "
-        f"Update {package_name} from {current_version} to {target_version}."
-    )
-
-    sarif = {
-        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [
-            {
-                "tool": {
-                    "driver": {
-                        "name": "dep-risk",
-                        "version": __version__,
-                        "informationUri": "https://github.com/robertwessen/dependency-update-risk",
-                        "rules": [
-                            {
-                                "id": cve_id,
-                                "name": "DependencyUpdateRisk",
-                                "shortDescription": {
-                                    "text": f"Breaking change risk for {cve_id} fix"
-                                },
-                                "helpUri": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
-                            }
-                        ],
-                    }
-                },
-                "results": [
-                    {
-                        "ruleId": cve_id,
-                        "level": _SARIF_LEVEL.get(risk_level, "note"),
-                        "message": {"text": summary},
-                        "locations": [
-                            {
-                                "logicalLocations": [
-                                    {
-                                        "name": package_name,
-                                        "kind": "package",
-                                        "fullyQualifiedName": (
-                                            f"{ecosystem}/{package_name}@{current_version}"
-                                        ),
-                                    }
-                                ]
-                            }
-                        ],
-                        "properties": {
-                            "risk_level": risk_level,
-                            "current_version": current_version,
-                            "target_version": target_version,
-                            "breaking_changes_count": len(result.get("breaking_changes", [])),
-                            **({"confidence": result["confidence"]} if "confidence" in result else {}),
-                        },
-                    }
-                ],
-            }
-        ],
-    }
-    return json.dumps(sarif, indent=2)
 
 
 def _check_exit_risk(actual_risk: str, threshold: str) -> bool:
@@ -572,45 +458,6 @@ async def _query_osv_batch(
     return unique
 
 
-def _estimate_previous_version(fixed_version: str) -> tuple[Optional[str], bool]:
-    """Returns (estimated_version, is_ambiguous). None means no reliable estimate."""
-    from packaging.version import InvalidVersion, Version
-
-    try:
-        v = Version(fixed_version)
-    except InvalidVersion:
-        return None, True
-    major, minor, micro = v.major, v.minor, v.micro
-    if micro > 0:
-        return f"{major}.{minor}.{micro - 1}", False  # unambiguous
-    elif minor > 0:
-        return f"{major}.{minor - 1}.0", True  # plausible lower bound
-    else:
-        return None, True  # X.0.0 — can't reliably guess
-
-
-def _fuzzy_match_package(pkg_filter: str, candidates: list) -> tuple[list, bool]:
-    """Match a package filter against affected packages; return (matches, was_fuzzy).
-
-    Tries exact case-insensitive match first, then falls back to matching on the
-    artifact component: last ':' segment for Maven coordinates (groupId:artifactId),
-    last '/' segment for Go module paths.
-    """
-    exact = [p for p in candidates if p.name.lower() == pkg_filter.lower()]
-    if exact:
-        return exact, False
-
-    def artifact_id(name: str) -> str:
-        if ":" in name:
-            return name.split(":")[-1]
-        if "/" in name:
-            return name.split("/")[-1]
-        return name
-
-    fuzzy = [p for p in candidates if artifact_id(p.name).lower() == pkg_filter.lower()]
-    return fuzzy, bool(fuzzy)
-
-
 @click.group()
 @click.version_option(version=__version__)
 def main() -> None:
@@ -839,341 +686,34 @@ def analyze(
     # Initialize cache
     cache = Cache(ttl_hours=cache_ttl) if not no_cache else None
 
-    # Per-finding context updated by the outer loop before each asyncio.run() call
-    forced_package_name: Optional[str] = None  # from scanner: which package was found
-    scanner_current_version: Optional[str] = None  # from scanner: installed version
-
-    async def run_analysis() -> list[dict]:
-        """Resolve one CVE and analyze all (or the filtered) affected packages.
-
-        Returns a list of result dicts — one per package analyzed.  The caller
-        iterates this list and collects everything into all_results.
-        """
-        # Step 1: Resolve CVE ─────────────────────────────────────────────────
-        if output_format == "rich":
-            console.print(f"\n[bold blue]Resolving CVE {cve_id}...[/bold blue]")
-
-        async with CVEResolver(config, cache) as resolver:
-            try:
-                cve_info = await resolver.resolve(cve_id)
-            except ValueError as e:
-                console.print(f"[bold red]Error:[/bold red] {e}")
-                sys.exit(1)
-
-        if not cve_info.affected_packages:
-            console.print(
-                f"[bold yellow]Warning:[/bold yellow] No affected packages found for {cve_id}"
-            )
-            sys.exit(1)
-
-        if output_format == "rich":
-            console.print(f"  Found {len(cve_info.affected_packages)} affected package(s)")
-            console.print(f"  Severity: {cve_info.severity.value}")
-            if cve_info.cvss_score:
-                console.print(f"  CVSS Score: {cve_info.cvss_score}")
-
-        # Step 2: Select which packages to analyze ────────────────────────────
-        if package:
-            # Explicit --package filter: exact match first, then fuzzy on artifact component
-            matches, was_fuzzy = _fuzzy_match_package(package, cve_info.affected_packages)
-            if not matches:
-                console.print(
-                    f"[bold red]Error:[/bold red] Package '{package}' not found in affected packages"
-                )
-                available = [p.name for p in cve_info.affected_packages]
-                console.print(f"Available packages: {', '.join(available)}")
-                sys.exit(1)
-            elif was_fuzzy and len(matches) > 1:
-                console.print(
-                    f"[bold red]Error:[/bold red] Ambiguous package '{package}' — "
-                    f"multiple matches found:"
-                )
-                for m in matches:
-                    console.print(f"  • {m.name}")
-                console.print("Use the full package coordinate with --package.")
-                sys.exit(1)
-            else:
-                if was_fuzzy and output_format == "rich":
-                    console.print(
-                        f"[dim]Note: matched '{package}' to full coordinate "
-                        f"'{matches[0].name}'[/dim]"
-                    )
-                packages_to_analyze = matches
-        elif forced_package_name:
-            # Scanner context: the scanner told us which specific package it found.
-            # Use fuzzy matching so Maven artifactId and Go last-segment work too.
-            matches, was_fuzzy = _fuzzy_match_package(
-                forced_package_name, cve_info.affected_packages
-            )
-            if not matches:
-                # CVE DB uses a different name than the scanner (e.g. "python-requests"
-                # vs "requests").  Fall back to all packages with a note.
-                if output_format == "rich":
-                    console.print(
-                        f"[dim]Note: Scanner found '{forced_package_name}' but CVE database "
-                        f"lists different package names. Analyzing all affected packages.[/dim]"
-                    )
-                packages_to_analyze = cve_info.affected_packages
-            else:
-                if was_fuzzy and output_format == "rich":
-                    console.print(
-                        f"[dim]Note: matched '{forced_package_name}' to "
-                        f"'{matches[0].name}'[/dim]"
-                    )
-                packages_to_analyze = matches
-        else:
-            # No filter: analyze every affected package.
-            packages_to_analyze = cve_info.affected_packages
-            if len(packages_to_analyze) > 1 and output_format == "rich":
-                console.print(
-                    f"[dim]CVE affects {len(packages_to_analyze)} package(s) — analyzing all. "
-                    f"Use --package to focus on one.[/dim]"
-                )
-
-        # Step 3: Fetch release notes for all packages in parallel ────────────
-        pkg_results: list[dict] = []
-
-        async with ReleaseNotesFetcher(config, cache) as fetcher:
-            for target_package in packages_to_analyze:
-                # Determine current/target versions for this specific package.
-                # Priority: --version CLI flag > scanner installed version > estimate
-                if original_current_version:
-                    pkg_current = original_current_version
-                elif scanner_current_version:
-                    pkg_current = scanner_current_version
-                else:
-                    pkg_current = None  # will be estimated below
-
-                target_version = (
-                    target_package.fixed_versions[0]
-                    if target_package.fixed_versions
-                    else "unknown"
-                )
-
-                # #13 — track whether current_version was estimated
-                version_was_estimated = False
-                estimate_basis: Optional[str] = None
-
-                if not pkg_current:
-                    if target_package.fixed_versions:
-                        estimated, version_is_ambiguous = _estimate_previous_version(
-                            target_package.fixed_versions[0]
-                        )
-                        if estimated is None:
-                            if output_format == "rich":
-                                console.print(
-                                    f"[bold yellow]Warning:[/bold yellow] Cannot estimate "
-                                    f"previous version for {target_package.fixed_versions[0]} "
-                                    f"(likely a major version boundary). "
-                                    f"Use --version to specify your current version."
-                                )
-                            pkg_current = "unknown"
-                        else:
-                            pkg_current = estimated
-                            version_was_estimated = True
-                            estimate_basis = (
-                                f"decremented from fixed version "
-                                f"{target_package.fixed_versions[0]}"
-                            )
-                            if version_is_ambiguous and output_format == "rich":
-                                console.print(
-                                    f"[dim]Note: Version {pkg_current} is an estimate. "
-                                    f"Use --version for accuracy.[/dim]"
-                                )
-                    else:
-                        pkg_current = "unknown"
-
-                # #14 — detect when no fix is available
-                fix_available = target_version != "unknown"
-
-                # Warn when version range is empty (would yield zero release notes)
-                if (
-                    fix_available
-                    and pkg_current != "unknown"
-                    and pkg_current == target_version
-                ):
-                    if output_format == "rich":
-                        console.print(
-                            f"[bold yellow]Warning:[/bold yellow] {target_package.name}: "
-                            f"current version ({pkg_current}) already matches fixed version — "
-                            f"no intermediate releases to fetch. "
-                            f"Use --version to specify your actual installed version."
-                        )
-
-                if output_format == "rich":
-                    console.print(
-                        f"\n[bold blue]Analyzing {target_package.name}...[/bold blue]"
-                    )
-                    console.print(f"  Current version: {pkg_current}")
-                    console.print(f"  Target version:  {target_version}")
-                    if not fix_available:
-                        console.print(
-                            f"[bold yellow]Warning:[/bold yellow] No fixed version is known "
-                            f"for {target_package.name}. There may be no patch available, "
-                            f"the package may be abandoned, or the CVE may be disputed. "
-                            f"Consider replacing or mitigating this dependency."
-                        )
-
-                # Only fetch release notes when a fix exists
-                release_notes = []
-                if fix_available:
-                    if output_format == "rich":
-                        console.print(f"\n[bold blue]Fetching release notes...[/bold blue]")
-                    release_notes = await fetcher.fetch_for_package(
-                        target_package,
-                        start_version=pkg_current,
-                        end_version=target_version,
-                    )
-                    if output_format == "rich":
-                        console.print(f"  Found {len(release_notes)} release note(s)")
-
-                # #17 — track ecosystem support and release notes availability
-                ecosystem_supported = target_package.ecosystem in _SUPPORTED_ECOSYSTEMS
-                release_notes_available = len(release_notes) > 0
-                if not ecosystem_supported and output_format == "rich":
-                    console.print(
-                        f"  [dim]⚠ Ecosystem '{target_package.ecosystem.value}' not yet "
-                        f"supported — release notes unavailable[/dim]"
-                    )
-
-                # Step 4: LLM analysis ────────────────────────────────────────
-                # Skip LLM when: no fix available, --no-llm flag, or API not configured
-                if not fix_available:
-                    result = {
-                        "cve_id": cve_info.cve_id,
-                        "package_name": target_package.name,
-                        "ecosystem": target_package.ecosystem.value,
-                        "current_version": pkg_current,
-                        "target_version": "unknown",
-                        "fix_available": False,
-                        "version_estimated": version_was_estimated,
-                        "version_estimate_basis": estimate_basis,
-                        "ecosystem_supported": ecosystem_supported,
-                        "release_notes_available": release_notes_available,
-                        "analysis_summary": (
-                            f"No fixed version is known for {target_package.name}. "
-                            f"This may mean no patch has been released, the package is "
-                            f"abandoned, or the CVE is disputed. Consider replacing or "
-                            f"mitigating this dependency manually."
-                        ),
-                    }
-                elif no_llm or not api_url or not api_key:
-                    if output_format == "rich":
-                        if no_llm:
-                            console.print(
-                                "[dim]LLM analysis disabled (--no-llm). "
-                                "Showing release notes.[/dim]"
-                            )
-                            _print_release_notes_list(release_notes, console)
-                        else:
-                            console.print(
-                                "[bold yellow]Warning:[/bold yellow] LLM API not configured. "
-                                "Set --api-url and --api-key or environment variables."
-                            )
-                            console.print("Skipping LLM analysis.")
-                    result = {
-                        "cve_id": cve_info.cve_id,
-                        "package_name": target_package.name,
-                        "ecosystem": target_package.ecosystem.value,
-                        "current_version": pkg_current,
-                        "target_version": target_version,
-                        "fix_available": True,
-                        "version_estimated": version_was_estimated,
-                        "version_estimate_basis": estimate_basis,
-                        "ecosystem_supported": ecosystem_supported,
-                        "release_notes_available": release_notes_available,
-                        "severity": cve_info.severity.value,
-                        "cvss_score": cve_info.cvss_score,
-                        "release_notes_analyzed": len(release_notes),
-                        "note": (
-                            "LLM analysis disabled (--no-llm)"
-                            if no_llm
-                            else "LLM analysis skipped - API not configured"
-                        ),
-                    }
-                else:
-                    if output_format == "rich":
-                        console.print(
-                            f"\n[bold blue]Analyzing breaking changes with LLM...[/bold blue]"
-                        )
-
-                    async with LLMAnalyzer(config) as analyzer:
-                        try:
-                            analysis = await analyzer.analyze(
-                                cve_info,
-                                target_package,
-                                release_notes,
-                                pkg_current,
-                                target_version,
-                            )
-                        except (ValueError, RuntimeError) as e:
-                            console.print(f"[bold red]Error:[/bold red] {e}")
-                            sys.exit(1)
-
-                    result = analysis.model_dump()
-                    result["ecosystem"] = analysis.ecosystem.value
-                    result["risk_level"] = analysis.risk_level.value
-                    # Overlay CVEInfo fields for output consistency with --no-llm mode
-                    result["severity"] = cve_info.severity.value
-                    result["cvss_score"] = cve_info.cvss_score
-                    # #13 — overlay estimated-version metadata onto the serialized result
-                    result["version_estimated"] = version_was_estimated
-                    result["version_estimate_basis"] = estimate_basis
-                    result["fix_available"] = True
-                    # #17 — overlay ecosystem support fields
-                    result["ecosystem_supported"] = ecosystem_supported
-                    result["release_notes_available"] = release_notes_available
-
-                # Output this package's results ────────────────────────────────
-                json_output = json.dumps(result, indent=2, default=str)
-
-                if output_format == "markdown":
-                    output_str = _format_markdown(result)
-                elif output_format == "sarif":
-                    output_str = _format_sarif(result)
-                else:
-                    output_str = json_output
-
-                if output:
-                    # First package writes; subsequent packages append
-                    mode = "w" if not pkg_results else "a"
-                    with open(output, mode) as f:
-                        f.write(output_str + ("\n" if pkg_results else ""))
-                    if output_format == "rich" and not pkg_results:
-                        console.print(f"\n[green]Results written to {output}[/green]")
-                elif output_format == "json":
-                    if len(items_to_process) <= 1:
-                        # Single-CVE mode: emit one JSON object immediately (backward-compatible).
-                        print(json_output)
-                    # Multi-CVE (SBOM/scanner) mode: defer — outer loop emits the full array.
-                    # Do NOT fall through to the rich output branch in either case.
-                elif output_format in ("markdown", "sarif"):
-                    print(output_str)
-                else:
-                    console.print("\n")
-                    _print_rich_results(result)
-
-                pkg_results.append(result)
-
-        return pkg_results
-
+    # Dispatch each finding to run_cve_analysis() — the analysis module does the work
     original_current_version = current_version
     all_results: list[dict] = []
+    is_multi = len(items_to_process) > 1
     for finding in items_to_process:
-        # Rebind outer variables captured by the run_analysis() closure
-        cve_id = finding.cve_id  # noqa: F841 (used via closure)
-        forced_package_name = finding.package_name  # noqa: F841
-        scanner_current_version = finding.package_version  # noqa: F841
-        current_version = original_current_version  # reset per-CVE
-        pkg_results = asyncio.run(run_analysis())
+        pkg_results = asyncio.run(
+            run_cve_analysis(
+                cve_id=finding.cve_id,
+                config=config,
+                cache=cache,
+                console=console,
+                output_format=output_format,
+                current_version=original_current_version,
+                package_filter=package,
+                forced_package_name=finding.package_name,
+                scanner_current_version=finding.package_version,
+                no_llm=no_llm,
+                output_file=output,
+                is_multi_item=is_multi,
+            )
+        )
         all_results.extend(pkg_results)
 
     # Multi-CVE (SBOM / scanner) mode: emit a single JSON array for all results.
-    # Single-CVE mode already printed its one object inside run_analysis().
-    if output_format == "json" and len(items_to_process) > 1:
+    if output_format == "json" and is_multi:
         print(json.dumps(all_results, indent=2, default=str))
 
-    # CI exit code: exit 1 if ANY CVE meets or exceeds threshold
+    # CI exit code: exit 1 if ANY result meets or exceeds the risk threshold
     if min_exit_risk:
         for r in all_results:
             actual_risk = r.get("risk_level", "")
@@ -1184,87 +724,6 @@ def analyze(
                         f"[bold]{actual_risk}[/bold] meets --min-exit-risk threshold ({min_exit_risk})"
                     )
                 sys.exit(1)
-
-
-def _print_release_notes_list(release_notes: list, console: Console) -> None:
-    """Print release notes as a formatted list (used in --no-llm mode)."""
-    if not release_notes:
-        console.print("[dim]  No release notes found in the version range.[/dim]")
-        return
-    console.print("\n[bold]Release Notes[/bold]")
-    for note in release_notes[:10]:
-        date_str = f" ({note.date.strftime('%Y-%m-%d')})" if note.date else ""
-        console.print(
-            f"\n  [bold cyan]v{note.version}[/bold cyan]{date_str} — [dim]{note.source}[/dim]"
-        )
-        content_lines = note.content.strip().split("\n")
-        for line in content_lines[:4]:
-            if line.strip():
-                console.print(f"    {line.strip()}")
-    if len(release_notes) > 10:
-        console.print(f"\n  [dim]... and {len(release_notes) - 10} more[/dim]")
-
-
-def _print_rich_results(result: dict) -> None:
-    """Print results with rich formatting."""
-    # Risk level color
-    risk_level = result.get("risk_level", "unknown")
-    risk_colors = {
-        "low": "green",
-        "medium": "yellow",
-        "high": "red",
-        "critical": "bold red",
-    }
-    risk_color = risk_colors.get(risk_level, "white")
-
-    # Header panel
-    header = f"""[bold]CVE:[/bold] {result.get('cve_id', 'N/A')}
-[bold]Package:[/bold] {result.get('package_name', 'N/A')} ({result.get('ecosystem', 'N/A')})
-[bold]Version:[/bold] {result.get('current_version', '?')} → {result.get('target_version', '?')}
-[bold]Risk Level:[/bold] [{risk_color}]{risk_level.upper()}[/{risk_color}]"""
-
-    if "confidence" in result:
-        header += f"\n[bold]Confidence:[/bold] {result['confidence']:.0%}"
-
-    console.print(Panel(header, title="Risk Analysis", border_style="blue"))
-
-    # Summary
-    if result.get("analysis_summary"):
-        console.print(Panel(result["analysis_summary"], title="Summary", border_style="dim"))
-
-    # Breaking changes
-    breaking_changes = result.get("breaking_changes", [])
-    if breaking_changes:
-        table = Table(title="Breaking Changes", border_style="red")
-        table.add_column("Description", style="white")
-        table.add_column("Affected API", style="cyan")
-        table.add_column("Migration Hint", style="green")
-
-        for bc in breaking_changes:
-            if isinstance(bc, dict):
-                table.add_row(
-                    bc.get("description", ""),
-                    bc.get("affected_api", "-"),
-                    bc.get("migration_hint", "-"),
-                )
-
-        console.print(table)
-
-    # Migration notes
-    migration_notes = result.get("migration_notes", [])
-    if migration_notes:
-        console.print("\n[bold]Migration Notes:[/bold]")
-        for note in migration_notes:
-            console.print(f"  • {note}")
-
-    # Deprecations
-    deprecations = result.get("deprecations", [])
-    if deprecations:
-        console.print("\n[bold yellow]Deprecations:[/bold yellow]")
-        for dep in deprecations:
-            console.print(f"  ⚠ {dep}")
-
-    console.print()
 
 
 @main.command()
